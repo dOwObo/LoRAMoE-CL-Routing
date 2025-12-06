@@ -1,0 +1,12 @@
+{
+    "BoolQA": [],
+    "COPA": [],
+    "MultiRC": [],
+    "NLI": [],
+    "QQP": [],
+    "SC": [{"dataset name": "amazon"}],
+    "TC": [{"dataset name": "agnews"},
+           {"dataset name": "dbpedia"},
+           {"dataset name": "yahoo"}],
+    "WiC": []
+}
