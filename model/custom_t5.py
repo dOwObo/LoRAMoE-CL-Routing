@@ -1,86 +1,229 @@
 # model/custom_t5.py
-import torch
-from transformers import T5ForConditionalGeneration
 import os
 import json
-import logging
+import torch
+from transformers import T5ForConditionalGeneration
 
+from .layers import LoRALayer, MoEBlock
 from .forward_modifier import apply_lora_to_ffn, apply_moe_to_ffn
+from helper.logging import setup_logger
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 class CustomT5Model:
-    def __init__(self, base_model_path: str, device: torch.device = None, num_experts: int = 4, expert_rank: int = 4):
+    """
+    自定義 T5 模型容器，支援 LoRA/MoEBlock 兩種模式切換
+    """
+    def __init__(self, base_model_path: str, device: torch.device = None,
+                 adapter_type: str = "MoEBlock", dynamic_expansion = False,
+                 num_experts: int = 4,  expert_rank: int = 4,  top_k: int = 2):
+
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.model = T5ForConditionalGeneration.from_pretrained(base_model_path).to(self.device)
-        self.num_experts = num_experts     # <--- 新增用於儲存模型於下一輪訓練時載入可以抓到
-        self.expert_rank = expert_rank     # <--- 新增用於儲存模型於下一輪訓練時載入可以抓到
-        # apply_lora_to_ffn, apply_moe_to_ffn: 用於修改模型的前向傳播層（Feed-Forward Network）
-        # 現在只有用了moe_to_ffn
-        self.model = apply_moe_to_ffn(self.model, num_experts=num_experts, expert_rank=expert_rank)
+        
+        # 1. 載入基礎模型
+        logger.info(f"[Model] 初始化 T5 模型，基礎路徑: {base_model_path}")
+        self.model = T5ForConditionalGeneration.from_pretrained(base_model_path)
+        
+        # 2. 儲存超參數
+        self.base_model_path = base_model_path
+        self.adapter_type = adapter_type
+        self.dynamic_expansion = dynamic_expansion
+        self.num_experts = num_experts
+        self.expert_rank = expert_rank
+        self.top_k = top_k
+
+        # 3. 根據 adapter_type 決定使用哪種架構
+        if adapter_type == "LoRA":
+            logger.info(f"[Model] 將 FFN 替換成標準 LoRA 架構: Rank={expert_rank}")
+            # 使用 expert_rank 作為 LoRA 的 rank
+            self.model = apply_lora_to_ffn(
+                self.model, 
+                dynamic_expansion=dynamic_expansion,
+                rank=expert_rank
+            )
+        elif adapter_type == "MoEBlock":
+            logger.info(f"[Model] 將 FFN 替換成 MoEBlock 架構: Experts={num_experts}, Rank={expert_rank}, TopK={top_k}")
+            self.model = apply_moe_to_ffn(
+                self.model, 
+                dynamic_expansion=dynamic_expansion,
+                num_experts=num_experts, 
+                expert_rank=expert_rank,
+                top_k=top_k
+            )
+        else:
+            msg = f"[Error] 未知的 adapter_type: {adapter_type}"
+            logger.error(msg)
+            raise ValueError(msg)
+        
         self.model.to(self.device)
+    
+    def get_moe_usage(self):
+        """
+        收集全模型所有 MoEBlock 的專家使用數據
+        """
+        usage_data = {"encoder": [], "decoder": []}
+        
+        def get_counts(block, layer_idx):
+            """
+            安全地從 block 中提取 selection_counts
+            """
+            if hasattr(block.layer, "layer") and len(block.layer) > layer_idx:
+                ffn_layer = block.layer[layer_idx].DenseReluDense
+                # 確認是否已經被替換為 MoEBlock (具備 selection_counts)
+                if hasattr(ffn_layer, "selection_counts"):
+                    # .cpu().numpy().tolist() 確保回傳的是標準 Python List，不佔用 GPU Graph
+                    return ffn_layer.selection_counts.cpu().numpy().tolist()
+            return None
+
+        # 收集 Encoder (標準 T5 Encoder FFN 在 index 1)
+        for block in self.model.encoder.block:
+            counts = get_counts(block, 1)
+            if counts is not None: 
+                usage_data["encoder"].append(counts)
+
+        # 收集 Decoder (標準 T5 Encoder FFN 在 index 2)
+        for block in self.model.decoder.block:
+            counts = get_counts(block, 2)
+            if counts is not None: 
+                usage_data["decoder"].append(counts)
+            
+        return usage_data
+
+    def reset_moe_usage(self):
+        """
+        重置所有 MoE 層的統計數據，確保統計的是當前任務的專家使用率，而非歷史累積
+        """
+        count = 0
+
+        # 重置 Encoder 的 MoE 層
+        for block in self.model.encoder.block:
+            if hasattr(block.layer[1].DenseReluDense, "reset_stats"):
+                block.layer[1].DenseReluDense.reset_stats()
+                count += 1
+
+        # 重置 Decoder 的 MoE 層
+        for block in self.model.decoder.block:
+            if hasattr(block.layer[2].DenseReluDense, "reset_stats"):
+                block.layer[2].DenseReluDense.reset_stats()
+                count += 1
+
+        logger.info(f"[Model] 已重置 {count} 個 MoE 層的統計數據 (歸零)")
+
+    def expand_model_structure(self):
+        """
+        遍歷模型所有層，對 LoRA/MoEBlock 擴充物理參數結構
+        """
+        count = 0
+        for module in self.model.modules():
+            if isinstance(module, (LoRALayer, MoEBlock)):
+                if hasattr(module, "add_new_task"):
+                    module.add_new_task()
+                    count += 1
+
+        logger.info(f"[Model] Structure Expanded: {count} modules updated.")
 
     def save_pretrained(self, save_directory: str):
         """
-        保存模型及其自定義配置。
+        保存模型權重及其自定義配置。
         """
         os.makedirs(save_directory, exist_ok=True)
 
-        # 使用 Hugging Face 的方法保存模型
-        self.model.save_pretrained(save_directory)
+        # 偵測目前的擴充次數
+        expansion_count = 1
+        try:
+            # 取得第一個 Block 的 FFN 層
+            sample_layer = self.model.encoder.block[0].layer[1].DenseReluDense
+            
+            if isinstance(sample_layer, LoRALayer) and sample_layer.dynamic_expansion:
+                expansion_count = len(sample_layer.lora_As)
+            elif isinstance(sample_layer, MoEBlock) and sample_layer.experts[0].dynamic_expansion:
+                expansion_count = len(sample_layer.experts[0].lora_As)
+        except Exception as e:
+            logger.warning(f"[Warning] 無法偵測擴充次數，預設為 1: {e}")
 
-        # 保存自定義配置
+        # 1. 保存模型權重
+        state_dict_path = os.path.join(save_directory, "model_state_dict.pt")
+        torch.save(self.model.state_dict(), state_dict_path)
+        logger.info(f"[System] 模型權重已保存: {state_dict_path}")
+
+        # 2. 保存自定義配置
         config = {
+            "base_model_path": self.base_model_path,
+            "adapter_type": self.adapter_type,
+            "dynamic_expansion": self.dynamic_expansion,
+            "expansion_count":expansion_count,
             "num_experts": self.num_experts,
-            "expert_rank": self.expert_rank
+            "expert_rank": self.expert_rank,
+            "top_k": self.top_k
         }
-        with open(os.path.join(save_directory, "custom_config.json"), "w", encoding="utf-8") as f:
+        config_path = os.path.join(save_directory, "custom_config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
+        logger.info(f"[System] 自定義配置已保存: {config_path}")
 
     @classmethod
     def load_pretrained(cls, load_directory: str, device: torch.device = None):
         """
-        從保存目錄加載模型及其自定義配置。
+        從保存目錄加載模型及其自定義配置，讀取 Config -> 建立完整 MoE 架構 -> 載入權重。
         """
-        # 嘗試使用標準的 from_pretrained 方法
-        try:
-            # 這會嘗試載入 'pytorch_model.bin' 等標準檔案
-            model = T5ForConditionalGeneration.from_pretrained(load_directory).to(device)
-            logger.info("使用 from_pretrained 成功載入模型。")
-        except OSError:
-            logger.warning("標準模型權重文件未找到，嘗試從 'model_state_dict.pt' 載入。")
-            # 如果找不到標準檔案，嘗試載入自定義的 state_dict
-            model = T5ForConditionalGeneration.from_pretrained("./initial_model/t5-large").to(device)
-            state_dict_path = os.path.join(load_directory, "model_state_dict.pt")
-            if not os.path.exists(state_dict_path):
-                raise FileNotFoundError(f"找不到 state_dict 文件: {state_dict_path}")
-            state_dict = torch.load(state_dict_path, map_location=device)
-            model.load_state_dict(state_dict, strict=False)
-            logger.info("從 'model_state_dict.pt' 成功載入模型權重。")
-
-        # 載入自定義配置
+        # 1. 讀取自定義配置
         config_path = os.path.join(load_directory, "custom_config.json")
         if not os.path.exists(config_path):
-            raise FileNotFoundError(f"找不到自定義配置文件: {config_path}")
-
+            msg = f"[Error] 找不到自定義配置文件: {config_path}"
+            logger.error(msg)
+            raise FileNotFoundError(msg)
+        
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-        num_experts = config.get("num_experts", 4)
-        expert_rank = config.get("expert_rank", 8)
+        # 讀取參數
+        base_model_path = config.get("base_model_path")
+        adapter_type = config.get("adapter_type")
+        dynamic_expansion = config.get("dynamic_expansion")
+        expansion_count = config.get("expansion_count")
+        num_experts = config.get("num_experts")
+        expert_rank = config.get("expert_rank")
+        top_k = config.get("top_k")
 
-        # 初始化實例
+        # 2. 初始化實例，建立帶有 LoRA/MoEBlock 結構
         instance = cls(
-            base_model_path="./initial_model/t5-large",  # 使用基礎模型路徑
+            base_model_path=base_model_path,
             device=device,
+            adapter_type=adapter_type,
+            dynamic_expansion=dynamic_expansion,
             num_experts=num_experts,
-            expert_rank=expert_rank
+            expert_rank=expert_rank,
+            top_k=top_k
         )
 
-        # 設定模型權重
-        instance.model = model
-        instance.model = apply_moe_to_ffn(instance.model, num_experts=num_experts, expert_rank=expert_rank)
-        instance.model.to(device)
+        # 3. 手動擴充模型架構以匹配存檔
+        if dynamic_expansion and expansion_count > 1:
+            logger.info(f"[Model] 偵測到存檔包含 {expansion_count} 組歷史參數，正在重建模型結構...")
+            # 初始建立時已有 1 組，所以需額外擴充 (count - 1) 次
+            for i in range(expansion_count - 1):
+                instance.expand_model_structure()
+                logger.info(f"  - Expanded to task {i+2}")
 
+        # 4. 載入微調後的權重
+        state_dict_path = os.path.join(load_directory, "model_state_dict.pt")
+        if os.path.exists(state_dict_path):
+            state_dict = torch.load(state_dict_path, map_location=device)
+            keys_missing, keys_unexpected = instance.model.load_state_dict(state_dict, strict=False)
+
+            # 檢查缺失
+            if keys_missing:
+                logger.warning(f"[Warning] 載入權重時缺失了部分 Key (可能正常，如未微調部分): {keys_missing[:5]}...")
+
+            # 檢查多餘
+            if keys_unexpected:
+                logger.warning(f"[Warning] 檔案中包含未使用的多餘權重: {keys_unexpected[:5]}...")
+
+            logger.info(f"[Model] 成功載入訓練後 {adapter_type} 模型權重: {state_dict_path}")
+        else:
+            logger.warning(f"[Warning] 找不到 {state_dict_path}，僅載入了基礎模型與隨機初始化的 MoE 參數")
+
+        
+        # 確保模型在正確的 device
+        instance.model.to(device)
+        
         return instance
