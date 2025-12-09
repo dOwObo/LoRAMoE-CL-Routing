@@ -6,19 +6,22 @@ import pandas as pd
 from torch.utils.data import DataLoader, Subset
 from datasets import Dataset
 from transformers import AutoTokenizer
-
 from helper.logging import setup_logger
+from datasets import disable_progress_bar
+disable_progress_bar()
 
 logger = setup_logger(__name__)
 
 class DataProcessor:
-    def __init__(self, 
-                 data_file: str, 
-                 labels_file: str, 
-                 peft_model_path: str, 
-                 max_input_length: int = 512, 
-                 max_label_length: int = 32, 
-                 config_dir: str = "configs"):
+    def __init__(
+        self, 
+        data_file: str, 
+        labels_file: str, 
+        peft_model_path: str, 
+        max_input_length: int = 256, 
+        max_label_length: int = 50, 
+        config_dir: str = "configs"
+    ):
         """
         讀取資料、標籤映射、Tokenizer 初始化以及資料集的 Dataset/Task 判定
         """
@@ -33,40 +36,40 @@ class DataProcessor:
         self.task_config = self.load_json(os.path.join(self.config_dir, "task.json"))
         self.instruction_config = self.load_json(os.path.join(self.config_dir, "instruction_config.json"))
 
-        # 2. 讀取原始資料
+        # 2. 讀取原始資料與標籤
         self.data_df = self.load_data(self.data_file)
-
-        # 3. 讀取標籤
         self.labels_list = self.load_labels(self.labels_file)
         
         # 建立 Label <-> ID 的雙向映射字典
         self.label_to_id = {label: idx for idx, label in enumerate(self.labels_list)}
         self.id_to_label = {idx: label for idx, label in enumerate(self.labels_list)}
 
-        # 取得專案根目錄
-        ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # 3. 初始化 Tokenizer
+        self._init_tokenizer()
 
-        # 設定設定備用的基礎模型路徑
-        base_model_path = os.path.join(ROOT_DIR, "initial_model/t5-large")
-
-        # 檢查 peft_model_path 是否包含 config.json
-        if os.path.exists(os.path.join(self.peft_model_path, "config.json")):
-            config_path = self.peft_model_path
-        else:
-            logger.warning(f"[Warning] `{self.peft_model_path}` 缺少 `config.json`，改用 `{base_model_path}`")
-            config_path = base_model_path
-
-        # 4. 初始化 Tokenizer
-        logger.info(f"[Data] 使用 tokenizer 設定檔: {config_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config_path)
-        self.tokenizer.padding_side = "right"
-
-        # 5. 確定資料集名稱和任務類型
+        # 4. 確定資料集名稱和任務類型
         self.dataset_name = self.get_dataset_name(self.data_file)
         self.task = self.get_task_from_dataset(self.dataset_name)
         self.instruction = self.get_instruction(self.task)
 
         logger.info(f"[Data] 資料載入完成，Dataset: {self.dataset_name}, Task: {self.task}")
+
+    def _init_tokenizer(self):
+        """
+        初始化 Tokenizer，包含路徑檢查與 fallback 機制
+        """
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        base_model_path = os.path.join(root_dir, "initial_model/t5-large")
+
+        config_path = self.peft_model_path
+        # 檢查 peft_model_path 是否包含 tokenizer_config.json
+        if not os.path.exists(os.path.join(config_path, "tokenizer_config.json")):
+            logger.warning(f"[Warning] `{config_path}` 缺少 `tokenizer_config.json`，改用 `{base_model_path}`")
+            config_path = base_model_path
+
+        logger.info(f"[Data] 使用 tokenizer 設定檔: {config_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(config_path, use_fast=True)
+        self.tokenizer.padding_side = "right"
 
     def load_json(self, filepath):
         """
@@ -76,11 +79,11 @@ class DataProcessor:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data
-        except FileNotFoundError:
-            logger.error(f"[Error] 配置文件不存在: {filepath}")
-            raise
         except json.JSONDecodeError as e:
             logger.error(f"[Error] 解析 JSON 文件失敗: {filepath}, 錯誤: {e}")
+            raise
+        except FileNotFoundError:
+            logger.error(f"[Error] 配置文件不存在: {filepath}")
             raise
 
     def load_data(self, filepath):
@@ -90,7 +93,7 @@ class DataProcessor:
         try:
             data_df = pd.read_json(filepath)
             return data_df
-        except ValueError as e:
+        except json.JSONDecodeError as e:
             logger.error(f"[Error] 讀取數據文件時出錯: {filepath}, 錯誤: {e}")
             raise
         except FileNotFoundError:
@@ -99,14 +102,11 @@ class DataProcessor:
 
     def load_labels(self, filepath):
         """
-        加載標籤文件並轉換為 Snake_Case
+        加載標籤文件
         """
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 labels = json.load(f)
-
-            # 將標籤轉換為 Snake_Case
-            labels = [label.replace(" ", "_") for label in labels]
             
             # 檢查是否有重複標籤
             if len(labels) != len(set(labels)):
@@ -114,11 +114,11 @@ class DataProcessor:
                 logger.error(msg)
                 raise ValueError(msg)
             return labels
-        except FileNotFoundError:
-            logger.error(f"[Error] 標籤文件不存在: {filepath}")
-            raise
         except json.JSONDecodeError as e:
             logger.error(f"[Error] 解析標籤 JSON 文件失敗: {filepath}, 錯誤: {e}")
+            raise
+        except FileNotFoundError:
+            logger.error(f"[Error] 標籤文件不存在: {filepath}")
             raise
 
     def get_dataset_name(self, data_file):
@@ -138,8 +138,7 @@ class DataProcessor:
         從 task_config 中獲取所有數據集名稱
         """
         datasets = []
-        # Question: task 沒用到能不能刪掉？
-        for task, dataset_list in self.task_config.items():
+        for _, dataset_list in self.task_config.items():
             for dataset in dataset_list:
                 datasets.append(dataset["dataset name"])
 
@@ -225,13 +224,12 @@ class DataProcessor:
         label_texts = [self.labels_list[idx] for idx in examples["label_id"]]
 
         # 使用 tokenizer 處理目標文字
-        with self.tokenizer.as_target_tokenizer():
-            labels = self.tokenizer(
-                label_texts,
-                max_length=self.max_label_length,
-                padding="max_length",
-                truncation=True
-            )
+        labels = self.tokenizer(
+            label_texts,
+            max_length=self.max_label_length,
+            padding="max_length",
+            truncation=True
+        )
 
         # 3. 處理 Labels 的 Padding Mask
         label_masks = labels["attention_mask"]
@@ -294,7 +292,7 @@ class DataProcessor:
         )
     
     # [Testing]
-    def get_subset_dataloader(self, dataset, batch_size, collate_fn, subset_size=500, shuffle=True):
+    def get_subset_dataloader(self, dataset, batch_size, collate_fn, subset_size, shuffle=True):
         """
         從 dataset 中隨機抽取 subset_size 筆資料，並返回相應的 DataLoader
         """

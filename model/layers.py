@@ -3,26 +3,30 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.t5.modeling_t5 import T5DenseActDense
-
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
 
-def orthogonal_projection(old_param, new_param):
+def orthogonal_projection(old_param: torch.Tensor, new_param: torch.Tensor) -> torch.Tensor:
     """
     將新參數投影到與舊參數正交的空間，減少對舊知識的干擾
     """
     if old_param is None or old_param.numel() == 0:
         return new_param
     
+    # [注意] 若 param 很大，QR 分解可能較慢，需注意效能
     Q, _ = torch.linalg.qr(old_param.T)
     new_proj = new_param - (new_param @ Q) @ Q.T
 
     return new_proj
 
 class LoRALayer(nn.Module):
-    def __init__(self, original_layer, rank: int = 4, dynamic_expansion: bool = False):
+    def __init__(
+        self, 
+        original_layer: nn.Module,
+        dynamic_expansion: bool = False, 
+        rank: int = 8
+    ):
         """
         Args:
             dynamic_expansion (bool): 
@@ -31,8 +35,9 @@ class LoRALayer(nn.Module):
         """
         super().__init__()
         self.original_layer = original_layer
-        self.rank = rank
         self.dynamic_expansion = dynamic_expansion
+        self.rank = rank
+        self.dropout = nn.Dropout(0.1)
 
         # 根據 CL 策略初始化
         if self.dynamic_expansion:
@@ -44,12 +49,12 @@ class LoRALayer(nn.Module):
             self.new_pair_parameters()
         else:
             # 定義 LoRA 兩個低秩矩陣，lora_A: (rank, in_dim) -> 負責降維，lora_B: (out_dim, rank) -> 負責升維
-            self.lora_A = nn.Parameter(torch.zeros((self.rank, original_layer.wi.weight.size(1)))) 
-            self.lora_B = nn.Parameter(torch.zeros((original_layer.wi.weight.size(0), self.rank)))
+            in_dim = original_layer.wi.weight.size(1)
+            out_dim = original_layer.wi.weight.size(0)
+            self.lora_A = nn.Parameter(torch.zeros((self.rank, in_dim))) 
+            self.lora_B = nn.Parameter(torch.zeros((out_dim, self.rank)))
 
             self.reset_parameters()
-        
-        self.dropout = nn.Dropout(0.1)
 
     def reset_parameters(self):
         """
@@ -72,7 +77,7 @@ class LoRALayer(nn.Module):
 
         nn.init.kaiming_uniform_(new_A, a=math.sqrt(5))
 
-        # 正交投影 (僅在已有舊參數時執行)
+        # 若已有舊參數，進行正交投影初始化
         if len(self.lora_As) > 0:
             old_A = self.lora_As[-1].detach()
             new_A.data = orthogonal_projection(old_A, new_A.data)
@@ -92,14 +97,12 @@ class LoRALayer(nn.Module):
             for param in self.lora_Bs: param.requires_grad = False
             # 建立新參數
             self.new_pair_parameters()
-            logger.info(f"[Model] LoRALayer Expanded: Now has {len(self.lora_As)} adapters.")
         else:
             # 保留舊知識，不重置
             self.lora_A.requires_grad = True
             self.lora_B.requires_grad = True
-            logger.info("[Model] LoRALayer Fixed: Ready for new task training (params reused).")
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Args:
             hidden_states: (Batch, Seq_Len, Dim)
@@ -111,7 +114,7 @@ class LoRALayer(nn.Module):
         lora_output = torch.zeros_like(intermediate)
         if self.dynamic_expansion:
             for A, B in zip(self.lora_As, self.lora_Bs):
-                lora_output += (self.dropout(hidden_states) @ self.lora_A.T) @ self.lora_B.T
+                lora_output += (self.dropout(hidden_states) @ A.T) @ B.T
                 """
                 # [Debug] 觀察 LoRA 有沒有學到東西
                 lora_norm = lora_output.norm().item()
@@ -136,7 +139,8 @@ class LoRALayer(nn.Module):
         """
         計算正交 Loss ，只在 Dynamic Expansion CL 有效
         """
-        if not self.dynamic_expansion or len(self.lora_As) < 2:
+        # 非 dynamic_expansion，或 Task 1 
+        if lambda_orth <= 0 or not self.dynamic_expansion or len(self.lora_As) < 2:
             return 0.0
         
         loss = 0
@@ -150,15 +154,20 @@ class LoRALayer(nn.Module):
         return lambda_orth * loss
 
 class Router(nn.Module):
-    """
-    決定每個 token 該去哪個專家，支援 Top-1 和 Top-K 兩種模式。
-    """
-    def __init__(self, input_dim, num_experts, top_k=2):
+    def __init__(
+        self, 
+        input_dim: int, 
+        num_experts: int, 
+        top_k: int = 2
+    ):
+        """
+        決定每個 token 該去哪個專家，支援 Top-1 和 Top-K 兩種模式。
+        """
         super().__init__() 
         self.gate = nn.Linear(input_dim, num_experts)
         self.top_k = top_k
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor):
         """
         Args:
             hidden_states: (Batch, Seq_Len, Dim)
@@ -182,16 +191,27 @@ class Router(nn.Module):
         return top_k_experts, scores
 
 class MoEBlock(nn.Module):
-    """
-    將 T5 原始 FFN 層替換成 Router 和多個 LoRALayer (Experts)。
-    """
-    def __init__(self, original_layer, dynamic_expansion=False, num_experts=4, expert_rank=4, top_k=2):
+    def __init__(
+        self, 
+        original_layer: nn.Module, 
+        dynamic_expansion: bool = False, 
+        num_experts: int = 4, 
+        expert_rank: int = 8, 
+        top_k: int = 2
+    ):
+        """
+        將 T5 原始 FFN 層替換成 Router 和多個 LoRALayer (Experts)。
+        """
         super().__init__()
 
         # 初始化 Router
-        self.router = Router(original_layer.wi.weight.size(1), num_experts, top_k=top_k)
+        input_dim = original_layer.wi.weight.size(1)
+        self.router = Router(input_dim, num_experts, top_k=top_k)
         # 建立專家列表，每個專家都是一個 LoRALayer，共享原本的 T5 權重，但有獨立的 LoRA 參數
-        self.experts = nn.ModuleList([LoRALayer(original_layer, dynamic_expansion, rank=expert_rank) for _ in range(num_experts)])
+        self.experts = nn.ModuleList([
+            LoRALayer(original_layer, dynamic_expansion, rank=expert_rank) 
+            for _ in range(num_experts)
+        ])
         # 統計數據，記錄每個專家被選擇次數，不存入 model_state_dict
         self.register_buffer("selection_counts", torch.zeros(num_experts, dtype=torch.long), persistent=False)
         # 儲存最後一次的分數 (用於計算 Load Balancing Loss)
@@ -199,15 +219,11 @@ class MoEBlock(nn.Module):
 
     def add_new_task(self):
         """
-        當新任務來時，新增 LoRA 參數或專家數量
+        當新任務來時，新增 LoRA 參數
         """
+        # 新增 LoRA 參數
         for expert in self.experts:
             expert.add_new_task()
-
-        """
-        [新增專家]
-        self.experts.append()
-        """
 
         self.reset_stats()
 
@@ -217,7 +233,7 @@ class MoEBlock(nn.Module):
         """
         self.selection_counts.zero_()
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router 決定每個 token 要給哪個專家
         top_k_experts, scores = self.router(hidden_states)
         self.last_scores = scores
@@ -226,6 +242,7 @@ class MoEBlock(nn.Module):
         outputs = torch.zeros_like(hidden_states)
 
         for i, expert in enumerate(self.experts):
+            mask = None
 
             # Top-K (Soft Routing)
             if isinstance(top_k_experts, tuple):
@@ -249,25 +266,46 @@ class MoEBlock(nn.Module):
                 # Step 2: 建立遮罩 (batch, seq) -> (batch, seq, 1)
                 mask = is_selected.float().unsqueeze(-1)
 
-            # 擴展維度以符合 hidden_states，(batch, seq, 1) -> (batch, seq, hidden_dim)
-            mask = mask.expand_as(hidden_states)
-            expert_output = expert(hidden_states)
+            if mask is not None:
+                # 擴展維度以符合 hidden_states，(batch, seq, 1) -> (batch, seq, hidden_dim)
+                mask = mask.expand_as(hidden_states)
+                expert_output = expert(hidden_states)
 
-            # 專家被選中時進行計算
-            outputs += mask * expert_output
+                # 專家被選中時進行計算
+                outputs += mask * expert_output
 
-            """
-            [累加 Mask 值]（已棄用）
-            Code: self.selection_counts[i] += int(mask.sum().item())
-            原因: 在 Top-k 模式下，mask 裡存放的是 0.0 到 1.0 之間的權重值。直接加總得到的是「該專家的總權重負載 (Total Load)」，而非「被選中的次數」。
+                """
+                [累加 Mask 值]（已棄用）
+                Code: self.selection_counts[i] += int(mask.sum().item())
+                原因: 在 Top-k 模式下，mask 裡存放的是 0.0 到 1.0 之間的權重值。直接加總得到的是「該專家的總權重負載 (Total Load)」，而非「被選中的次數」。
 
-            [統計實際大於 0 的 mask]（目前使用）
-            將所有大於 0 的值視為 True，只要該專家參與該 Token 的計算，就計為 +1。
-            """
+                [統計實際大於 0 的 mask]（目前使用）
+                將所有大於 0 的值視為 True，只要該專家參與該 Token 的計算，就計為 +1。
+                """
 
-            # 更新統計數據
-            with torch.no_grad():
-                selected_count = (mask[..., 0] > 0).sum()
-                self.selection_counts[i] += selected_count
+                # 更新統計數據
+                with torch.no_grad():
+                    self.selection_counts[i] += (mask[..., 0] > 0).sum()
         
         return outputs
+    
+    def compute_balance_loss(self, lambda_balance: float) -> torch.Tensor:
+        """
+        計算負載均衡損失
+        """
+        if lambda_balance <= 0 or self.last_scores is None:
+            return 0.0
+        
+        """
+        [注意] last_scores 只會保存最後一個 Micro-Batch 的分數。使用 accumulation_steps，這個 Loss 只反映最後一小批資料的負載均衡狀況，導致 Loss 計算不穩定（Noisy）。
+        """
+        # [batch_size, seq_len, num_experts] -> [seq_len, num_experts] -> [num_experts]
+        expert_mean_usage = self.last_scores.mean(dim=0).mean(dim=0) 
+        
+        num_experts = self.last_scores.size(-1)
+        balance_target = 1.0 / num_experts
+
+        # 使用 MSE 計算當前分佈與均勻分佈的差異
+        loss = ((expert_mean_usage - balance_target)**2).mean()
+
+        return lambda_balance * loss

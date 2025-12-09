@@ -3,28 +3,29 @@ import os
 import json
 import torch
 from transformers import T5ForConditionalGeneration
-
-from .layers import LoRALayer, MoEBlock
-from .forward_modifier import apply_lora_to_ffn, apply_moe_to_ffn
+from model.layers import LoRALayer, MoEBlock
+from model.forward_modifier import apply_lora_to_ffn, apply_moe_to_ffn
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
 
 class CustomT5Model:
-    """
-    自定義 T5 模型容器，支援 LoRA/MoEBlock 兩種模式切換
-    """
-    def __init__(self, base_model_path: str, device: torch.device = None,
-                 adapter_type: str = "MoEBlock", dynamic_expansion = False,
-                 num_experts: int = 4,  expert_rank: int = 4,  top_k: int = 2):
-
+    def __init__(
+        self, 
+        base_model_path: str, 
+        device: torch.device = None,
+        adapter_type: str = "MoEBlock", 
+        dynamic_expansion: bool = False,
+        num_experts: int = 4,  
+        expert_rank: int = 8,  
+        top_k: int = 2
+    ):
+        """
+        自定義 T5 模型容器，支援 LoRA/MoEBlock 兩種模式切換
+        """
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
-        # 1. 載入基礎模型
-        logger.info(f"[Model] 初始化 T5 模型，基礎路徑: {base_model_path}")
-        self.model = T5ForConditionalGeneration.from_pretrained(base_model_path)
-        
-        # 2. 儲存超參數
+        # 1. 儲存超參數
         self.base_model_path = base_model_path
         self.adapter_type = adapter_type
         self.dynamic_expansion = dynamic_expansion
@@ -32,26 +33,30 @@ class CustomT5Model:
         self.expert_rank = expert_rank
         self.top_k = top_k
 
+        # 2. 載入基礎模型
+        logger.info(f"[Model] 初始化 T5: {base_model_path}")
+        self.model = T5ForConditionalGeneration.from_pretrained(base_model_path)
+
         # 3. 根據 adapter_type 決定使用哪種架構
         if adapter_type == "LoRA":
             logger.info(f"[Model] 將 FFN 替換成標準 LoRA 架構: Rank={expert_rank}")
             # 使用 expert_rank 作為 LoRA 的 rank
             self.model = apply_lora_to_ffn(
                 self.model, 
-                dynamic_expansion=dynamic_expansion,
+                dynamic_expansion,
                 rank=expert_rank
             )
         elif adapter_type == "MoEBlock":
             logger.info(f"[Model] 將 FFN 替換成 MoEBlock 架構: Experts={num_experts}, Rank={expert_rank}, TopK={top_k}")
             self.model = apply_moe_to_ffn(
                 self.model, 
-                dynamic_expansion=dynamic_expansion,
-                num_experts=num_experts, 
-                expert_rank=expert_rank,
-                top_k=top_k
+                dynamic_expansion,
+                num_experts, 
+                expert_rank,
+                top_k
             )
         else:
-            msg = f"[Error] 未知的 adapter_type: {adapter_type}"
+            msg = f"[Error] Unknown adapter_type: {adapter_type}"
             logger.error(msg)
             raise ValueError(msg)
         
@@ -67,7 +72,7 @@ class CustomT5Model:
             """
             安全地從 block 中提取 selection_counts
             """
-            if hasattr(block.layer, "layer") and len(block.layer) > layer_idx:
+            if len(block.layer) > layer_idx:
                 ffn_layer = block.layer[layer_idx].DenseReluDense
                 # 確認是否已經被替換為 MoEBlock (具備 selection_counts)
                 if hasattr(ffn_layer, "selection_counts"):
@@ -111,16 +116,18 @@ class CustomT5Model:
 
     def expand_model_structure(self):
         """
-        遍歷模型所有層，對 LoRA/MoEBlock 擴充物理參數結構
+        遍歷模型所有層，對 LoRA/MoEBlock 擴充參數結構
         """
         count = 0
         for module in self.model.modules():
-            if isinstance(module, (LoRALayer, MoEBlock)):
+            # LoRA 和 MoE 內部的 Expert LoRA，執行擴充
+            if isinstance(module, LoRALayer):
                 if hasattr(module, "add_new_task"):
                     module.add_new_task()
                     count += 1
 
-        logger.info(f"[Model] Structure Expanded: {count} modules updated.")
+        self.model.to(self.device)
+        logger.info(f"[Model] Structure Expanded: {count} LoRA modules updated.")
 
     def save_pretrained(self, save_directory: str):
         """
@@ -178,12 +185,12 @@ class CustomT5Model:
 
         # 讀取參數
         base_model_path = config.get("base_model_path")
-        adapter_type = config.get("adapter_type")
-        dynamic_expansion = config.get("dynamic_expansion")
-        expansion_count = config.get("expansion_count")
-        num_experts = config.get("num_experts")
-        expert_rank = config.get("expert_rank")
-        top_k = config.get("top_k")
+        adapter_type = config.get("adapter_type", "MoEBlock")
+        dynamic_expansion = config.get("dynamic_expansion", False)
+        expansion_count = config.get("expansion_count", 1)
+        num_experts = config.get("num_experts", 4)
+        expert_rank = config.get("expert_rank", 8)
+        top_k = config.get("top_k", 2)
 
         # 2. 初始化實例，建立帶有 LoRA/MoEBlock 結構
         instance = cls(
@@ -202,7 +209,7 @@ class CustomT5Model:
             # 初始建立時已有 1 組，所以需額外擴充 (count - 1) 次
             for i in range(expansion_count - 1):
                 instance.expand_model_structure()
-                logger.info(f"  - Expanded to task {i+2}")
+                logger.info(f"[Model] Restoring structure: Expanded to task {i+2}")
 
         # 4. 載入微調後的權重
         state_dict_path = os.path.join(load_directory, "model_state_dict.pt")
