@@ -1,209 +1,268 @@
 # main.py
+import os
+import csv
+import shutil
+import argparse
+import random
+import numpy as np
 import torch
-from torch.nn import CrossEntropyLoss
-
-from model.custom_t5 import CustomT5Model
 from dataset.data_processor import DataProcessor
-# 使用 helper/utils.py 的 collate_fn
+from model.custom_t5 import CustomT5Model
 from helper.utils import collate_fn
 from helper.trainer import Trainer
-import argparse
-import logging
-import os
-import json
-import shutil
-from helper.inference_efficiency import measure_inference_time, get_vram_usage
-from transformers import set_seed
+from helper.logging import setup_logger
+# from helper.inference_efficiency import measure_inference_time, get_vram_usage
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
+
+def print_trainable_parameters(model):
+    """
+    可訓練參數統計
+    """
+    trainable_params = 0
+    all_param = 0
+    lora_trainable = 0
+    lora_total = 0
+    
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+            # 特別檢查 LoRA/Expert 相關參數
+            if "lora_" in name or "experts" in name:
+                lora_trainable += num_params
+        
+        if "lora_" in name or "experts" in name:
+            lora_total += num_params
+
+    # 計算百分比
+    percent_trainable = 100 * trainable_params / all_param
+    
+    logger.info("\n" + "="*15 + " Parameter Check " + "="*15)
+    logger.info(f"Total Params:          {all_param:,}")
+    logger.info(f"Trainable Params:      {trainable_params:,} ({percent_trainable:.4f}%)")
+    logger.info(f"LoRA/MoE Params (All): {lora_total:,}")
+    logger.info(f"LoRA/MoE Trainable:    {lora_trainable:,}")
+    logger.info("="*47 + "\n")
+
+def set_seed(seed):
+    """
+    固定隨機亂數種子，確保實驗結果的可複現性 (Reproducibility)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def parse_args():
+    """
+    解析命令列參數，將超參數參數化以便實驗調整
+    """
     parser = argparse.ArgumentParser(description="Train a custom T5 model with LoRA and MoE for Continual Learning.")
-    parser.add_argument('--data_file', type=str, required=True, help='Path to the training data file (JSON).')
-    parser.add_argument('--labels_file', type=str, required=True, help='Path to the labels file (JSON).')
-    parser.add_argument('--model_path', type=str, default=None, help='Path to the pre-trained model to load (optional).')
-    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save the fine-tuned model.')
-    parser.add_argument('--eval_file', type=str, required=True, help='Path to the evaluation data file (JSON).')
-    parser.add_argument('--eval_labels_files', type=str, required=True, help='Path to the labels file (JSON).')
-    parser.add_argument('--test_data_files', type=str, nargs='*', default=[], help='List of test data files (JSON).')
-    parser.add_argument('--test_labels_files', type=str, nargs='*', default=[], help='List of test labels files (JSON).')
-    parser.add_argument('--seed', type=int, help='seed')
+    # 資料路徑設定
+    parser.add_argument('--data_file', type=str, required=True, help='Path to training data (JSON).')
+    parser.add_argument('--labels_file', type=str, required=True, help='Path to training labels (JSON).')
+    parser.add_argument('--eval_file', type=str, required=True, help='Path to eval data (JSON).')
+    parser.add_argument('--eval_labels_files', type=str, required=True, help='Path to eval labels (JSON).')
+    parser.add_argument('--test_data_files', type=str, nargs='*', default=[], help='List of paths to test data files.')
+    parser.add_argument('--test_labels_files', type=str, nargs='*', default=[], help='List of paths to test labels files.')
+    # 儲存路徑設定
+    parser.add_argument('--output_dir', type=str, required=True, help='Output directory to save model.')
+    parser.add_argument('--plot_dir', type=str, default=None, help='Specific directory to save plots.')
+    parser.add_argument('--dataset_name', type=str, default="", help='Name of the dataset for logging/plotting.')
+    # 模型架構設定
+    parser.add_argument('--base_model_name', type=str, default="./initial_model/t5-large", help='Base model identifier (e.g., t5-small, t5-large).')
+    parser.add_argument('--model_path', type=str, default=None, help='Path to a pretrained custom model (for CL Task 2+).')
+    parser.add_argument('--adapter_type', type=str, default="MoEBlock", choices=["LoRA", "MoEBlock"], help='Type of adapter: "LoRA" or "MoEBlock".')
+    parser.add_argument('--dynamic_expansion', action='store_true', help='Enable Dynamic Expansion CL (freeze old, add new params).')
+    parser.add_argument('--num_experts', type=int, default=4, help='Number of experts in MoE.')
+    parser.add_argument('--expert_rank', type=int, default=8, help='Rank of LoRA matrices.')
+    parser.add_argument('--top_k', type=int, default=2, help='Top-K routing selection.')
+    # 訓練參數設定
+    parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+    parser.add_argument('--num_epochs', type=int, default=3, help='Number of epochs.')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate.')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size per device.')
+    parser.add_argument('--accumulation_steps', type=int, default=8, help='Gradient accumulation steps.')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Gradient clipping threshold.')
+    # Loss 權重設定
+    parser.add_argument('--lambda_orth', type=float, default=0.0, help='Weight for Orthogonal Loss.')
+    parser.add_argument('--lambda_balance', type=float, default=0.0, help='Weight for MoE Load Balancing Loss.')
+    # 其他設定
+    parser.add_argument('--max_input_length', type=int, default=256, help='Max sequence length for input.')
+    parser.add_argument('--max_label_length', type=int, default=50, help='Max sequence length for labels.')
+    parser.add_argument('--debug', action='store_true', help='Debug mode (use small subset of data).')
+    
     return parser.parse_args()
 
-def save_custom_model(custom_model, output_dir):
-    """
-    自訂保存流程：保存 state_dict 和自定義配置。
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 保存模型的 state_dict
-    state_dict_path = os.path.join(output_dir, "model_state_dict.pt")
-    torch.save(custom_model.model.state_dict(), state_dict_path)
-    logger.info(f"Model state_dict saved to {state_dict_path}")
-    
-    # 保存自定義配置
-    config = {
-        "num_experts": custom_model.num_experts,
-        "expert_rank": custom_model.expert_rank
-    }
-    config_path = os.path.join(output_dir, "custom_config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
-    logger.info(f"Custom config saved to {config_path}")
-
-def load_custom_model(load_directory, device):
-    """
-    自訂加載流程：加載 state_dict 和自定義配置，並初始化模型。
-    """
-    custom_model = CustomT5Model.load_pretrained(load_directory, device=device)
-    logger.info(f"Model loaded from {load_directory}")
-    return custom_model
-
-if __name__ == "__main__":
+def main():
     args = parse_args()
+
+    # ========== 1. 環境設定 ==========
     
     # 設定隨機種子
     set_seed(args.seed)
-
-    data_file = args.data_file
-    labels_file = args.labels_file
-    model_path = args.model_path
-    output_dir = args.output_dir
-    eval_file = args.eval_file
-    eval_labels_files = args.eval_labels_files
-    test_data_files = args.test_data_files
-    test_labels_files = args.test_labels_files
-    
-    # 直接刪除舊的 `output_dir` 並重新建立
-    if os.path.exists(output_dir):
-        print(f"🗑️ 刪除舊的輸出目錄: {output_dir}")
-        shutil.rmtree(output_dir)  # **刪除整個目錄**
-    os.makedirs(output_dir, exist_ok=True)  # **重新建立新的空目錄**
-    print(f"✅ 已重新建立輸出目錄: {output_dir}")
-
-    base_model_path = "./initial_model/t5-large"
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # batch_size = 4
-    # max_input_length = 256
-    # max_label_length = 16
+    # [Debug]
+    if torch.cuda.is_available():
+        logger.info(f"[System] Currently using GPU: {torch.cuda.get_device_name(device)}")
 
-    # OLoRA 的配置 但max_input_length=512會OOM
-    batch_size = 4
-    max_input_length = 256
-    max_label_length = 50
+    # 處理輸出目錄
+    if os.path.exists(args.output_dir):
+        logger.info(f"[System] 刪除舊的輸出目錄: {args.output_dir}")
+        shutil.rmtree(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger.info(f"[System] 已建立輸出目錄: {args.output_dir}")
 
-    # 讀取訓練資料
+    # ========== 2. 資料處理 ==========
+
+    # 如果是載入舊模型 (CL Task 2+)，tokenizer 應該沿用舊模型的設定
+    tokenizer_path = args.model_path if args.model_path else "./initial_model/" + args.base_model_name
+    # 防呆：如果本地沒有 initial_model，改用 huggingface ID
+    if not os.path.exists(tokenizer_path) and not args.model_path:
+        tokenizer_path = args.base_model_name
+
+    logger.info(f"[System] 正在處理訓練資料: {args.data_file}")
     train_processor = DataProcessor(
-        data_file=data_file,
-        labels_file=labels_file,
-        peft_model_path=base_model_path,
-        max_input_length=max_input_length,
-        max_label_length=max_label_length
+        data_file=args.data_file,
+        labels_file=args.labels_file,
+        peft_model_path=tokenizer_path,
+        max_input_length=args.max_input_length,
+        max_label_length=args.max_label_length
     )
     train_dataset = train_processor.get_dataset()
-    train_dataloader = train_processor.get_dataloader(
-        train_dataset, 
-        batch_size=batch_size, 
-        collate_fn=collate_fn  # utils.py 的 collate_fn
-    )
-    #DEL 創建訓練集的 500 筆子集
-    train_subset_dataloader = train_processor.get_subset_dataloader(
-        train_dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        subset_size=500,
-        shuffle=True
-    )
 
-    # 驗證資料
+    logger.info(f"[System] 正在處理驗證資料: {args.eval_file}")
     eval_processor = DataProcessor(
-        data_file=eval_file,
-        labels_file=eval_labels_files,
-        peft_model_path=base_model_path,
-        max_input_length=max_input_length,
-        max_label_length=max_label_length
+        data_file=args.eval_file,
+        labels_file=args.eval_labels_files,
+        peft_model_path=tokenizer_path,
+        max_input_length=args.max_input_length,
+        max_label_length=args.max_label_length
     )
     eval_dataset = eval_processor.get_dataset()
-    eval_dataloader = eval_processor.get_dataloader(
-        eval_dataset, 
-        batch_size=batch_size, 
-        collate_fn=collate_fn,
-    )
-    #DEL 創建驗證集的 500 筆子集
-    eval_subset_dataloader = eval_processor.get_subset_dataloader(
-        eval_dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        subset_size=500,
-        shuffle=True
-    )
 
-    # 建立 T5 + LoRA 模型
-    # 如果有指定模型路徑，則加載模型，否則初始化新模型
-    if model_path:
-        logger.info(f"Loading model from {model_path}...")
-        if not os.path.exists(model_path):
-            logger.error(f"指定的模型路徑不存在: {model_path}")
-            raise FileNotFoundError(f"指定的模型路徑不存在: {model_path}")
-        # custom_model = CustomT5Model.load_pretrained(model_path, device=device)
-        custom_model = load_custom_model(model_path, device=device)
-        logger.info("Model loaded successfully.")
+    # 根據 Debug 模式決定 DataLoader
+    if args.debug:
+        logger.info("[System] 使用小型資料集進行快速測試")
+        train_dataloader = train_processor.get_subset_dataloader(
+            train_dataset, 
+            args.batch_size, 
+            collate_fn, 
+            subset_size=100, 
+            shuffle=True
+        )
+        eval_dataloader = eval_processor.get_subset_dataloader(
+            eval_dataset, 
+            args.batch_size, 
+            collate_fn, 
+            subset_size=100, 
+            shuffle=False
+        )
     else:
-        logger.info("Initializing new model...")
-        custom_model = CustomT5Model(base_model_path, device=device, num_experts=4, expert_rank=8) # 設置專家數量和每個專家的秩
-        logger.info("Model initialized successfully.")
+        train_dataloader = train_processor.get_dataloader(
+            train_dataset, 
+            args.batch_size, 
+            collate_fn
+        )
+        eval_dataloader = eval_processor.get_dataloader(
+            eval_dataset, 
+            args.batch_size, 
+            collate_fn
+        )
+        
+    # ========== 3. 初始化模型 ==========
 
-    model = custom_model.model  # 這邊使用的是 T5ForConditionalGeneration
+    # 持續學習 (Task 2+) 或載入微調好的模型
+    if args.model_path:
+        logger.info(f"[System] Loading pretrained custom model from: {args.model_path}")
+        custom_model = CustomT5Model.load_pretrained(
+            load_directory=args.model_path, 
+            device=device
+        )
+        
+        # 若 MoEBlock，重置專家選擇統計數據
+        if args.adapter_type == "MoEBlock":
+            custom_model.reset_moe_usage()
+        # 若 dynamic_expansion，且載入舊模型，代表要為新任務擴充結構
+        if args.dynamic_expansion:
+            logger.info("[System] Detecting new task. Expanding model structure...")
+            custom_model.expand_model_structure()
+    # 新的訓練 (Task 1)
+    else:
+        logger.info(f"[System] Initializing new {args.adapter_type} model based on {args.base_model_name}...")
+        custom_model = CustomT5Model(
+            base_model_path=args.base_model_name,
+            device=device,
+            adapter_type=args.adapter_type,
+            dynamic_expansion=args.dynamic_expansion,
+            num_experts=args.num_experts,
+            expert_rank=args.expert_rank,
+            top_k=args.top_k
+        )
 
-    # 凍結除了 LoRA/MoE 以外的參數
-    # 凍結所有模型參數 then 解凍LoRA相關參數和專家層的參數
-    logger.info("凍結除了 LoRA/MoE 以外的參數...")
-    for param in model.parameters():
-        param.requires_grad = False
+    model = custom_model.model
+
+    # ========== 4. 參數凍結與解凍 ==========
+
+    logger.info("[System] 正在設定參數可訓練狀態 (Freeze/Unfreeze)...")
+
     for name, param in model.named_parameters():
-        if "lora_A" in name or "lora_B" in name:
+
+        # 解凍 Router/Gate
+        if "router" in name or "gate" in name:
             param.requires_grad = True
-        if "experts" in name:
-            param.requires_grad = True
-            # print(name)
-    logger.info("Parameter freezing completed.")
-    
-    # 檢索模型結構
-    # print(model)
-    # for name, param in model.named_parameters():
-    #     if "router" in name or "experts" in name or "lora_A" in name or "lora_B" in name:
-    #         print(name)
-    # 初始化 Trainer
+            continue
+
+        # 解凍 LoRA 參數
+        if "lora_" in name:
+            # 若 dynamic_expansion，且 Task 2+
+            if args.dynamic_expansion and args.model_path:
+                # 已透過 expand_model_structure() 凍結舊參數，解凍新參數
+                pass
+            else:
+                # 解凍所有相關參數
+                param.requires_grad = True
+        # 凍結基礎模型參數
+        else:
+            param.requires_grad = False
+        
+    logger.info("[Model] Parameter freezing completed.")
+
+    # ========== 5. 初始化 Trainer ==========
+
     trainer = Trainer(
         model=model,
+        model_wrapper=custom_model,
         train_dataloader=train_dataloader,
         eval_dataloader=eval_dataloader,
-        # DEL
-        # train_dataloader=train_subset_dataloader,
-        # eval_dataloader=eval_subset_dataloader,
         tokenizer=train_processor.tokenizer,
-        labels_list=train_processor.labels_list,
         device=device
     )
-    
-    allocated_before, total, usage_before = get_vram_usage()
 
-    # 開始訓練
-    # trainer.train(
-    #     num_epochs=1,
-    #     learning_rate=5e-6,       
-    #     output_dir=output_dir,
-    #     accumulation_steps=2
-    # )
+    # allocated_before, total, usage_before = get_vram_usage()
 
-    # # OLoRA 的配置 
+    # ========== 6. Training ==========
+
+    # [Debug]
+    print_trainable_parameters(model)
+
+    logger.info("[System] Start Training...")
     trainer.train(
-        num_epochs=3,
-        learning_rate=5e-4,       
-        output_dir=output_dir,
-        accumulation_steps=64
+        num_epochs=args.num_epochs,
+        learning_rate=args.lr,
+        output_dir=args.output_dir,
+        accumulation_steps=args.accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
+        lambda_orth=args.lambda_orth,
+        lambda_balance=args.lambda_balance,
+        plot_dir=args.plot_dir,
+        dataset_name=args.dataset_name
     )
 
     # allocated_after, _, usage_after = get_vram_usage()
@@ -211,51 +270,71 @@ if __name__ == "__main__":
     # print(f"模型本身 GPU VRAM 使用量: {allocated_before} MiB / {total} MiB ({usage_before:.2%})")
     # print(f"模型訓練 GPU VRAM 使用量: {allocated_after} MiB / {total} MiB ({usage_after:.2%})")
 
-    # 保存模型
-    logger.info(f"Saving model to {output_dir}...")
-    # custom_model.save_pretrained(output_dir)
-    save_custom_model(custom_model, output_dir)
-    logger.info("Model saved successfully.")
+    # ========== 7. 保存模型 ==========
+    
+    logger.info(f"[System] Saving model to {args.output_dir}...")
+    custom_model.save_pretrained(args.output_dir)
 
+    if train_processor.tokenizer:
+        train_processor.tokenizer.save_pretrained(args.output_dir)
 
+    # ========== 8. Testing ==========
 
-    # 測試資料
-    if test_data_files and test_labels_files:
-        if len(test_data_files) != len(test_labels_files):
-            logger.error("測試數據文件和標籤文件的數量不匹配。")
-            raise ValueError("測試數據文件和標籤文件的數量不匹配。")
+    # 儲存測試結果
+    test_results = os.path.join(os.path.dirname(args.output_dir), "cl_results.csv")
+    if not os.path.exists(test_results):
+        with open(test_results, 'w', newline='') as f:
+            csv.writer(f).writerow(['current_task', 'test_on_dataset', 'accuracy'])
+
+    if args.test_data_files:
+        logger.info("[System] Starting Testing Phase...")
         
-        logger.info("Starting testing on provided datasets...")
-        for test_data, test_labels in zip(test_data_files, test_labels_files):
-            logger.info(f"Testing on dataset: {test_data}")
+        if len(args.test_data_files) != len(args.test_labels_files):
+            msg = "[Error] 測試數據文件和標籤文件的數量不匹配"
+            logger.error(msg)
+            raise ValueError(msg)
+
+        for test_data, test_label in zip(args.test_data_files, args.test_labels_files):
+            test_dataset_name = os.path.basename(os.path.dirname(test_data))
+            logger.info(f"[System] 正在處理測試資料: {test_data}")
             test_processor = DataProcessor(
                 data_file=test_data,
-                labels_file=test_labels,
-                peft_model_path=base_model_path, 
-                max_input_length=max_input_length,
-                max_label_length=max_label_length
+                labels_file=test_label,
+                peft_model_path=tokenizer_path,
+                max_input_length=args.max_input_length,
+                max_label_length=args.max_label_length
             )
             test_dataset = test_processor.get_dataset()
-            test_dataloader = test_processor.get_dataloader(
-                test_dataset, 
-                batch_size=batch_size, 
-                collate_fn=collate_fn,
-            )
-            # DEL 創建測試集的 500 筆子集
-            test_subset_dataloader = test_processor.get_subset_dataloader(
-                test_dataset,
-                batch_size=batch_size,
-                collate_fn=collate_fn,
-                subset_size=500,
-                shuffle=True
-            )
+            
+            if args.debug:
+                logger.info("[System] 使用小型資料集進行快速測試")
+                test_dataloader = test_processor.get_subset_dataloader(
+                    test_dataset, 
+                    args.batch_size, 
+                    collate_fn, 
+                    subset_size=100, 
+                    shuffle=False
+                )
+            else:
+                test_dataloader = test_processor.get_dataloader(
+                    test_dataset, 
+                    args.batch_size, 
+                    collate_fn
+                )
+            
+            # 替換 Trainer 的 eval_loader 進行測試
             trainer.eval_dataloader = test_dataloader
-            # DEL
-            # trainer.eval_dataloader = test_subset_dataloader
-            test_accuracy = trainer.validate()
-            logger.info(f"Test Accuracy on {test_data}: {test_accuracy:.4f}")
+            test_acc = trainer.validate(test_dataset_name)
+            logger.info(f"Test Accuracy on {test_dataset_name}: {test_acc:.4f}")
+
+            # 將測試結果寫入 CSV
+            with open(test_results, 'a', newline='') as f:
+                csv.writer(f).writerow([args.dataset_name, test_dataset_name, float(test_acc)])
     else:
-        logger.info("No test datasets provided. Skipping testing.")
+        logger.warning("[Warning] No test files provided. Skipping testing.")
 
     # 測試推理時間
     # measure_inference_time(model, test_dataloader, device)
+
+if __name__ == "__main__":
+    main()
