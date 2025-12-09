@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
+import seaborn as sns
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -14,8 +14,6 @@ def collate_fn(batch):
     DataLoader 的校對函式 (Collate Function)。
     將 List[Dict] 轉換為 Dict[Tensor]，準備輸入給模型。
     """
-    
-    # 將 list of dicts 轉換為 dict of lists，再轉 tensor
     input_ids = torch.tensor([example["input_ids"] for example in batch], dtype=torch.long)
     attention_mask = torch.tensor([example["attention_mask"] for example in batch], dtype=torch.long)
     labels = torch.tensor([example["labels"] for example in batch], dtype=torch.long)
@@ -26,7 +24,7 @@ def collate_fn(batch):
         "labels": labels
     }
 
-def evaluate(model, dataloader, tokenizer, labels_list):
+def evaluate(model, dataloader, tokenizer, dataset_name):
     """
     讓模型生成文字，並計算 Accuracy，適用於 Seq2Seq 任務。
     """
@@ -38,12 +36,12 @@ def evaluate(model, dataloader, tokenizer, labels_list):
 
     # 切換至評估模式 (關閉 Dropout 等)
     model.eval()
-    logger.info("[System] 開始評估 (Evaluation)...")
+    logger.info(f"[System] 開始評估 {dataset_name} (Evaluation)...")
 
     with torch.no_grad():
 
         # 使用 tqdm 顯示進度條
-        progress_bar = tqdm(dataloader, desc="Evaluating", disable=False)
+        progress_bar = tqdm(dataloader, desc="Evaluating", disable=True)
 
         for batch_idx, batch in enumerate(progress_bar):
             
@@ -85,7 +83,7 @@ def evaluate(model, dataloader, tokenizer, labels_list):
 
     # 計算最終 Accuracy，避免分母為 0 的錯誤
     accuracy = correct / total if total > 0 else 0
-    logger.info(f"Accuracy: {accuracy:.4f}")
+    logger.info(f">>> 【{dataset_name}】Accuracy: {accuracy:.4f}")
 
     return accuracy
 
@@ -98,12 +96,10 @@ def plot_metrics(train_losses, val_accuracies, output_dir):
         os.makedirs(output_dir)
 
     epochs = range(1, len(train_losses) + 1)
+    train_losses = [l.item() if torch.is_tensor(l) else l for l in train_losses]
 
     # 建立畫布
     plt.figure(figsize=(12, 5))
-
-    # 處理 Tensor 與 Float 混合的情況
-    train_losses = [l.item() if torch.is_tensor(l) else l for l in train_losses]
 
     # 子圖 1: Training Loss
     plt.subplot(1, 2, 1)
@@ -112,8 +108,8 @@ def plot_metrics(train_losses, val_accuracies, output_dir):
     plt.ylabel('Loss')
     plt.title('Training Loss')
     plt.xticks(epochs)
-    plt.legend()
     plt.grid(True)
+    plt.legend()
 
     # 子圖 2: Validation Accuracy
     plt.subplot(1, 2, 2)
@@ -122,8 +118,8 @@ def plot_metrics(train_losses, val_accuracies, output_dir):
     plt.ylabel('Accuracy')
     plt.title('Validation Accuracy')
     plt.xticks(epochs)
-    plt.legend()
     plt.grid(True)
+    plt.legend()
 
     # 存檔
     plot_path = os.path.join(output_dir, 'training_metrics.png')
@@ -134,20 +130,68 @@ def plot_metrics(train_losses, val_accuracies, output_dir):
     # 關閉畫布釋放記憶體
     plt.close()
 
-def visualize_expert_selection(selection_counts, output_dir="."):
+def visualize_expert_selection(selection_counts, output_dir=".", title_suffix=""):
     """
-    繪製每一層 MoE 的專家被選中的頻率百分比分佈圖。
+    繪製專家被選中的長條圖(layer)與熱力圖(all)。
     """
+    if not selection_counts:
+        logger.warning(f"[Warning] {title_suffix} 無專家使用數據可供繪圖")
+        return
+    
     # 確保輸出目錄存在
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 遍歷每一層 (Layer)
-    for layer_idx, layer_selection_counts in enumerate(selection_counts):
-        
-        # 轉 numpy 方便計算
-        counts = np.array(layer_selection_counts)
-        total_tokens = counts.sum()
+    # 將數據轉為 numpy array
+    try:
+        data = np.array(selection_counts)
+    except Exception:
+        data = np.array([sc.cpu().numpy() if hasattr(sc, 'cpu') else sc for sc in selection_counts])
+
+    # 若維度不足，補齊維度
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    
+    num_layers, num_experts = data.shape
+
+    # 繪製熱力圖 (Heatmap)
+    try:
+        # 計算每一層的百分比 (Normalized by Layer)
+        row_sums = data.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1 # 避免除以 0
+        normalized_data = data / row_sums
+
+        # 建立畫布 (根據專家數和層數動態調整)
+        plt.figure(figsize=(num_experts * 1.5 + 2, num_layers * 0.5 + 2))
+        # 繪製 Heatmap
+        sns.heatmap(
+            normalized_data, 
+            annot=True,      # 顯示數值
+            fmt=".1%",       # 百分比格式 (如 25.0%)
+            cmap="YlGnBu",   # 0% 黃-綠-藍 100%
+            vmin=0, vmax=1,  # 固定範圍 0~100%
+            cbar_kws={'label': 'Selection Frequency'}
+        )
+        # 設定標題與軸標籤
+        plt.title(f"MoE Expert Utilization Heatmap ({title_suffix})")
+        plt.ylabel("Layer Index")
+        plt.xlabel("Expert Index")
+
+        # 存檔
+        heatmap_path = os.path.join(output_dir, f"expert_heatmap_{title_suffix.lower()}.png")
+        plt.tight_layout()
+        plt.savefig(heatmap_path, dpi=300)
+
+        # 關閉畫布釋放記憶體
+        plt.close()
+    except Exception as e:
+        logger.error(f"[Error] 繪製熱力圖失敗: {e}")
+
+    # 繪製分層長條圖 (Bar Charts)
+    bar_plot_dir = os.path.join(output_dir, f"layers_{title_suffix.lower()}")
+    os.makedirs(bar_plot_dir, exist_ok=True)
+    
+    for layer_idx, counts in enumerate(data):
+        total_tokens = counts.sum()        
 
         # 計算頻率
         if total_tokens > 0:
@@ -165,15 +209,16 @@ def visualize_expert_selection(selection_counts, output_dir="."):
         # 設定標題與軸標籤
         plt.title(f"Layer {layer_idx} Expert Selection Frequency")
         plt.xlabel("Expert Index")
-        plt.ylabel("Frequency (Ratio)")
+        plt.ylabel("Frequency")
         # 設定 y 軸範圍 0~110% 避免文字被切掉
         plt.ylim(0, 1.1)
 
         # 存檔
-        output_path = os.path.join(output_dir, f"layer_{layer_idx}_selection.png")
+        output_path = os.path.join(bar_plot_dir, f"layer_{layer_idx}.png")
         plt.tight_layout()
         plt.savefig(output_path)
-        logger.info(f"[System] Layer {layer_idx} 專家分佈圖已儲存至: {output_path}")
 
         # 關閉畫布釋放記憶體
         plt.close()
+
+    logger.info(f"[System] {title_suffix} 專家分佈圖已儲存至: {output_dir}")

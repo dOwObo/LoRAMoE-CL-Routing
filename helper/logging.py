@@ -1,6 +1,8 @@
 # helper/logging.py
 import logging
 import sys
+import colorama
+colorama.init(autoreset=True)
 
 COLORS = {
     "INFO": "\033[0m",       # 白色
@@ -19,7 +21,7 @@ class SimpleColorFormatter(logging.Formatter):
         # 格式化訊息: 顏色 + 原始訊息 + 重置顏色
         return f"{color}{record.getMessage()}{reset}"
 
-def setup_logger(name: str = __name__, log_level: int = logging.INFO):
+def setup_logger(name: str = __name__, log_level: int = logging.DEBUG):
     """
     通用 Logger 設定函式
     使用方式:
