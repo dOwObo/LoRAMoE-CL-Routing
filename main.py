@@ -21,29 +21,46 @@ def print_trainable_parameters(model):
     """
     trainable_params = 0
     all_param = 0
-    lora_trainable = 0
-    lora_total = 0
+    # LoRA & Experts (運算權重)
+    lora_expert_trainable = 0
+    lora_expert_total = 0
+    # Router & Gate (路由權重)
+    router_gate_trainable = 0
+    router_gate_total = 0
     
     for name, param in model.named_parameters():
         num_params = param.numel()
         all_param += num_params
+        # 全部可訓練
         if param.requires_grad:
             trainable_params += num_params
-            # 特別檢查 LoRA/Expert 相關參數
-            if "lora_" in name or "experts" in name:
-                lora_trainable += num_params
-        
-        if "lora_" in name or "experts" in name:
-            lora_total += num_params
+        # 檢查 Router/Gate
+        if "router" in name or "gate" in name:
+            router_gate_total += num_params
+            if param.requires_grad:
+                router_gate_trainable += num_params
+        # 檢查 LoRA/Expert
+        elif "lora_" in name or "experts" in name:
+            lora_expert_total += num_params
+            if param.requires_grad:
+                lora_expert_trainable += num_params
 
     # 計算百分比
-    percent_trainable = 100 * trainable_params / all_param
-    
+    percent_trainable = 100 * trainable_params / all_param if all_param > 0 else 0
+    percent_lora = 100 * lora_expert_trainable / lora_expert_total if lora_expert_total > 0 else 0
+    percent_router = 100 * router_gate_trainable / router_gate_total if router_gate_total > 0 else 0
+
     logger.info("\n" + "="*15 + " Parameter Check " + "="*15)
     logger.info(f"Total Params:          {all_param:,}")
     logger.info(f"Trainable Params:      {trainable_params:,} ({percent_trainable:.4f}%)")
-    logger.info(f"LoRA/MoE Params (All): {lora_total:,}")
-    logger.info(f"LoRA/MoE Trainable:    {lora_trainable:,}")
+    logger.info(f"[LoRA / Experts] Weights:")
+    logger.info(f"  - Total:               {lora_expert_total:,}")
+    logger.info(f"  - Trainable:           {lora_expert_trainable:,}")
+    logger.info(f"  - Status:              {'UNFROZEN' if lora_expert_trainable > 0 else 'FROZEN'} ({percent_lora:.2f}%)")
+    logger.info(f"[Router / Gate] Weights:")
+    logger.info(f"  - Total:               {router_gate_total:,}")
+    logger.info(f"  - Trainable:           {router_gate_trainable:,}")
+    logger.info(f"  - Status:              {'UNFROZEN' if router_gate_trainable > 0 else 'FROZEN'} ({percent_router:.2f}%)")
     logger.info("="*47 + "\n")
 
 def set_seed(seed):
@@ -211,23 +228,26 @@ def main():
     # ========== 4. 參數凍結與解凍 ==========
 
     logger.info("[System] 正在設定參數可訓練狀態 (Freeze/Unfreeze)...")
-
+    
     for name, param in model.named_parameters():
 
-        # 解凍 Router/Gate
-        if "router" in name or "gate" in name:
+        # Router/Gate 參數在 MoEBlock + Fixed-Architecture CL 解凍
+        if args.adapter_type == "MoEBlock" and not args.dynamic_expansion and ("router" in name or "gate" in name):
             param.requires_grad = True
             continue
 
-        # 解凍 LoRA 參數
+        # LoRA 參數
         if "lora_" in name:
-            # 若 dynamic_expansion，且 Task 2+
-            if args.dynamic_expansion and args.model_path:
+            # 在 LoRA/MoEBlock + Fixed-Architecture CL 解凍
+            if not args.dynamic_expansion:
+                param.requires_grad = True
+            # 在 LoRA + Dynamic-Expansion CL，且 Task 1 解凍
+            elif args.dynamic_expansion and not args.model_path:
+                param.requires_grad = True
+            # 在 LoRA + Dynamic-Expansion CL，且 Task 2+
+            else:
                 # 已透過 expand_model_structure() 凍結舊參數，解凍新參數
                 pass
-            else:
-                # 解凍所有相關參數
-                param.requires_grad = True
         # 凍結基礎模型參數
         else:
             param.requires_grad = False
