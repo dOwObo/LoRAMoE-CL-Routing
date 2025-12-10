@@ -4,13 +4,14 @@ import json
 import random
 import pandas as pd
 from torch.utils.data import DataLoader, Subset
-from datasets import Dataset
+from datasets import Dataset, disable_progress_bar
 from transformers import AutoTokenizer
 from helper.logging import setup_logger
-from datasets import disable_progress_bar
-disable_progress_bar()
 
 logger = setup_logger(__name__)
+
+# 關閉 datasets 處理資料時的進度條，避免洗版 Log 檔
+disable_progress_bar()
 
 class DataProcessor:
     def __init__(
