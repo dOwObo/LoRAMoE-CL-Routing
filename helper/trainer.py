@@ -3,7 +3,7 @@ import os
 import csv
 import torch
 from tqdm import tqdm
-from transformers.optimization import Adafactor, get_scheduler
+from transformers.optimization import get_scheduler
 from model.layers import LoRALayer, MoEBlock
 from helper.utils import evaluate, plot_metrics, visualize_expert_selection
 from helper.logging import setup_logger
@@ -42,26 +42,26 @@ class Trainer:
         output_dir: str, 
         accumulation_steps: int,
         max_grad_norm: float,
-        lambda_orth: float,
+        lambda_orth_l1: float,
+        lambda_orth_l2: float,
         lambda_balance: float,
         plot_dir: str,
-        dataset_name: str # 暫時沒用到
+        dataset_name: str
     ):
         """
         執行完整的訓練迴圈
         """
-        # 優化器設定，使用 Adafactor (T5 官方推薦)
-        optimizer = Adafactor(
+        # 優化器設定，使用 AdamW
+        optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()), 
-            scale_parameter=False, 
-            relative_step=False, 
-            lr=learning_rate
+            lr=learning_rate,
+            weight_decay=0.01
         )
 
-        # Linear Decay
+        # Constant learning rate
         num_training_steps = len(self.train_dataloader) * num_epochs
         scheduler = get_scheduler(
-            "linear", 
+            "constant", 
             optimizer=optimizer, 
             num_warmup_steps=0, 
             num_training_steps=num_training_steps
@@ -110,19 +110,31 @@ class Trainer:
                         # Loss 計算（Cross Entropy）
                         loss = outputs.loss
 
-                        # LoRA L2 Orthogonal Loss
-                        if lambda_orth > 0:
-                            loss += sum(
-                                module.compute_orth_loss(lambda_orth) 
+                        # LoRA L1 Orthogonal Loss (LoRA_A)
+                        orth_l1_loss = loss.new_zeros(())
+                        if lambda_orth_l1 > 0:
+                            orth_l1_loss = sum(
+                                module.compute_orth_abs_loss() 
+                                for module in self.model.modules() if isinstance(module, LoRALayer)
+                            )
+
+                        # LoRA L2 Orthogonal Loss (LoRA_A & LoRA_B)
+                        orth_l2_loss = loss.new_zeros(())
+                        if lambda_orth_l2 > 0:
+                            orth_l2_loss = sum(
+                                module.compute_orth_pow_loss() 
                                 for module in self.model.modules() if isinstance(module, LoRALayer)
                             )
 
                         # MoE Load Balancing Loss
+                        lb_loss = loss.new_zeros(())
                         if lambda_balance > 0:
-                            loss += sum(
-                                module.compute_balance_loss(lambda_balance) 
+                            lb_loss = sum(
+                                module.compute_balance_loss() 
                                 for module in self.model.modules() if isinstance(module, MoEBlock)
                             )
+
+                        loss = loss + (lambda_orth_l1 * orth_l1_loss) + (lambda_orth_l2 * orth_l2_loss) + (lambda_balance * lb_loss)
 
                         # 梯度累積
                         loss = loss / accumulation_steps
@@ -182,7 +194,7 @@ class Trainer:
                 # 若當前 Accuracy 優於歷史最佳，則保存模型
                 if val_accuracy > best_accuracy:
                     best_accuracy = val_accuracy
-                    save_path = os.path.join(output_dir, f"best_model_epoch_{epoch + 1}")
+                    save_path = os.path.join(output_dir, "best_model")
                     
                     if self.model_wrapper:
                         logger.info(f"[System] Saving best model via Wrapper to {save_path}")
@@ -211,9 +223,10 @@ class Trainer:
         plot_metrics(self.train_losses, self.val_accuracies, plot_dir)
 
         # 獲取 MoE 統計數據並視覺化
-        moe_usage = self.model_wrapper.get_moe_usage()
-        visualize_expert_selection(moe_usage['encoder'], plot_dir, title_suffix="Encoder")
-        visualize_expert_selection(moe_usage['decoder'], plot_dir, title_suffix="Decoder")
+        if self.model_wrapper.adapter_type == "MoEBlock":
+            moe_usage = self.model_wrapper.get_moe_usage()
+            visualize_expert_selection(moe_usage['encoder'], plot_dir, title_suffix="Encoder")
+            visualize_expert_selection(moe_usage['decoder'], plot_dir, title_suffix="Decoder")
     
     def validate(self, dataset_name):
         """

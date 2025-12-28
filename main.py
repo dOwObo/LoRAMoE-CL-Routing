@@ -83,8 +83,8 @@ def parse_args():
     # 資料路徑設定
     parser.add_argument('--data_file', type=str, required=True, help='Path to training data (JSON).')
     parser.add_argument('--labels_file', type=str, required=True, help='Path to training labels (JSON).')
-    parser.add_argument('--eval_file', type=str, required=True, help='Path to eval data (JSON).')
-    parser.add_argument('--eval_labels_files', type=str, required=True, help='Path to eval labels (JSON).')
+    parser.add_argument('--eval_file', type=str, default=None, help='Path to eval data (JSON).')
+    parser.add_argument('--eval_labels_files', type=str, default=None, help='Path to eval labels (JSON).')
     parser.add_argument('--test_data_files', type=str, nargs='*', default=[], help='List of paths to test data files.')
     parser.add_argument('--test_labels_files', type=str, nargs='*', default=[], help='List of paths to test labels files.')
     # 儲存路徑設定
@@ -98,16 +98,18 @@ def parse_args():
     parser.add_argument('--dynamic_expansion', action='store_true', help='Enable Dynamic Expansion CL (freeze old, add new params).')
     parser.add_argument('--num_experts', type=int, default=4, help='Number of experts in MoE.')
     parser.add_argument('--expert_rank', type=int, default=8, help='Rank of LoRA matrices.')
+    parser.add_argument('--lora_alpha', type=int, default=32, help='Alpha scaling factor for LoRA.')
     parser.add_argument('--top_k', type=int, default=2, help='Top-K routing selection.')
     # 訓練參數設定
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
-    parser.add_argument('--num_epochs', type=int, default=3, help='Number of epochs.')
-    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate.')
+    parser.add_argument('--num_epochs', type=int, default=1, help='Number of epochs.')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size per device.')
     parser.add_argument('--accumulation_steps', type=int, default=8, help='Gradient accumulation steps.')
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Gradient clipping threshold.')
     # Loss 權重設定
-    parser.add_argument('--lambda_orth', type=float, default=0.0, help='Weight for Orthogonal Loss.')
+    parser.add_argument('--lambda_orth_l1', type=float, default=0.0, help='Weight for Orthogonal Loss (Abs).')
+    parser.add_argument('--lambda_orth_l2', type=float, default=0.0, help='Weight for Orthogonal Loss (Square).')
     parser.add_argument('--lambda_balance', type=float, default=0.0, help='Weight for MoE Load Balancing Loss.')
     # 其他設定
     parser.add_argument('--max_input_length', type=int, default=256, help='Max sequence length for input.')
@@ -154,15 +156,19 @@ def main():
     )
     train_dataset = train_processor.get_dataset()
 
-    logger.info(f"[System] 正在處理驗證資料: {args.eval_file}")
-    eval_processor = DataProcessor(
-        data_file=args.eval_file,
-        labels_file=args.eval_labels_files,
-        peft_model_path=tokenizer_path,
-        max_input_length=args.max_input_length,
-        max_label_length=args.max_label_length
-    )
-    eval_dataset = eval_processor.get_dataset()
+    if args.eval_file:
+        logger.info(f"[System] 正在處理驗證資料: {args.eval_file}")
+        eval_processor = DataProcessor(
+            data_file=args.eval_file,
+            labels_file=args.eval_labels_files,
+            peft_model_path=tokenizer_path,
+            max_input_length=args.max_input_length,
+            max_label_length=args.max_label_length
+        )
+        eval_dataset = eval_processor.get_dataset()
+    else:
+        eval_dataset = None
+        eval_dataloader = None
 
     # 根據 Debug 模式決定 DataLoader
     if args.debug:
@@ -171,27 +177,29 @@ def main():
             train_dataset, 
             args.batch_size, 
             collate_fn, 
-            subset_size=100, 
+            subset_size=1000, 
             shuffle=True
         )
-        eval_dataloader = eval_processor.get_subset_dataloader(
-            eval_dataset, 
-            args.batch_size, 
-            collate_fn, 
-            subset_size=100, 
-            shuffle=False
-        )
+        if eval_dataset:
+            eval_dataloader = eval_processor.get_subset_dataloader(
+                eval_dataset, 
+                args.batch_size, 
+                collate_fn, 
+                subset_size=1000, 
+                shuffle=False
+            )
     else:
         train_dataloader = train_processor.get_dataloader(
             train_dataset, 
             args.batch_size, 
             collate_fn
         )
-        eval_dataloader = eval_processor.get_dataloader(
-            eval_dataset, 
-            args.batch_size, 
-            collate_fn
-        )
+        if eval_dataset:
+            eval_dataloader = eval_processor.get_dataloader(
+                eval_dataset, 
+                args.batch_size, 
+                collate_fn
+            )
         
     # ========== 3. 初始化模型 ==========
 
@@ -220,6 +228,7 @@ def main():
             dynamic_expansion=args.dynamic_expansion,
             num_experts=args.num_experts,
             expert_rank=args.expert_rank,
+            lora_alpha=args.lora_alpha,
             top_k=args.top_k
         )
 
@@ -279,7 +288,8 @@ def main():
         output_dir=args.output_dir,
         accumulation_steps=args.accumulation_steps,
         max_grad_norm=args.max_grad_norm,
-        lambda_orth=args.lambda_orth,
+        lambda_orth_l1=args.lambda_orth_l1,
+        lambda_orth_l2=args.lambda_orth_l2,
         lambda_balance=args.lambda_balance,
         plot_dir=args.plot_dir,
         dataset_name=args.dataset_name
@@ -332,7 +342,7 @@ def main():
                     test_dataset, 
                     args.batch_size, 
                     collate_fn, 
-                    subset_size=100, 
+                    subset_size=1000, 
                     shuffle=False
                 )
             else:

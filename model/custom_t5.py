@@ -18,6 +18,7 @@ class CustomT5Model:
         dynamic_expansion: bool = False,
         num_experts: int = 4,  
         expert_rank: int = 8,  
+        lora_alpha: int = 32,
         top_k: int = 2
     ):
         """
@@ -31,6 +32,7 @@ class CustomT5Model:
         self.dynamic_expansion = dynamic_expansion
         self.num_experts = num_experts
         self.expert_rank = expert_rank
+        self.lora_alpha = lora_alpha
         self.top_k = top_k
 
         # 2. 載入基礎模型
@@ -44,7 +46,8 @@ class CustomT5Model:
             self.model = apply_lora_to_ffn(
                 self.model, 
                 dynamic_expansion,
-                rank=expert_rank
+                rank=expert_rank,
+                lora_alpha=lora_alpha
             )
         elif adapter_type == "MoEBlock":
             logger.info(f"[Model] 將 FFN 替換成 MoEBlock 架構: Experts={num_experts}, Rank={expert_rank}, TopK={top_k}")
@@ -53,6 +56,7 @@ class CustomT5Model:
                 dynamic_expansion,
                 num_experts, 
                 expert_rank,
+                lora_alpha,
                 top_k
             )
         else:
@@ -150,8 +154,12 @@ class CustomT5Model:
 
         # 1. 保存模型權重
         state_dict_path = os.path.join(save_directory, "model_state_dict.pt")
-        torch.save(self.model.state_dict(), state_dict_path)
+        # 儲存可訓練參數
+        to_save = {k: v for k, v in self.model.state_dict().items() if v.requires_grad}
+        torch.save(to_save, state_dict_path)
         logger.info(f"[System] 模型權重已保存: {state_dict_path}")
+
+        total_rank = self.expert_rank * expansion_count
 
         # 2. 保存自定義配置
         config = {
@@ -159,14 +167,16 @@ class CustomT5Model:
             "adapter_type": self.adapter_type,
             "dynamic_expansion": self.dynamic_expansion,
             "expansion_count":expansion_count,
+            "total_rank": total_rank,
             "num_experts": self.num_experts,
             "expert_rank": self.expert_rank,
+            "lora_alpha": self.lora_alpha,
             "top_k": self.top_k
         }
         config_path = os.path.join(save_directory, "custom_config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
-        logger.info(f"[System] 自定義配置已保存: {config_path}")
+        logger.info(f"[System] 自定義配置 Rank={total_rank} 已保存: {config_path}")
 
     @classmethod
     def load_pretrained(cls, load_directory: str, device: torch.device = None):
@@ -190,6 +200,7 @@ class CustomT5Model:
         expansion_count = config.get("expansion_count", 1)
         num_experts = config.get("num_experts", 4)
         expert_rank = config.get("expert_rank", 8)
+        lora_alpha = config.get("lora_alpha", 32)
         top_k = config.get("top_k", 2)
 
         # 2. 初始化實例，建立帶有 LoRA/MoEBlock 結構
@@ -200,6 +211,7 @@ class CustomT5Model:
             dynamic_expansion=dynamic_expansion,
             num_experts=num_experts,
             expert_rank=expert_rank,
+            lora_alpha=lora_alpha,
             top_k=top_k
         )
 

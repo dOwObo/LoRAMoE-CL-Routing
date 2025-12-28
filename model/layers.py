@@ -25,7 +25,8 @@ class LoRALayer(nn.Module):
         self, 
         original_layer: nn.Module,
         dynamic_expansion: bool = False, 
-        rank: int = 8
+        rank: int = 8,
+        lora_alpha: int = 32
     ):
         """
         Args:
@@ -37,6 +38,8 @@ class LoRALayer(nn.Module):
         self.original_layer = original_layer
         self.dynamic_expansion = dynamic_expansion
         self.rank = rank
+        self.lora_alpha = lora_alpha
+        self.scaling = self.lora_alpha / self.rank
         self.dropout = nn.Dropout(0.1)
 
         # 根據 CL 策略初始化
@@ -123,6 +126,8 @@ class LoRALayer(nn.Module):
         else:
             lora_output = (self.dropout(hidden_states) @ self.lora_A.T) @ self.lora_B.T
         
+        lora_output = lora_output * self.scaling
+
         # 3. 加總: T5 (原始知識) + LoRA (微調知識)
         intermediate = intermediate + lora_output
 
@@ -135,23 +140,38 @@ class LoRALayer(nn.Module):
         
         return output
     
-    def compute_orth_loss(self, lambda_orth: float) -> torch.Tensor:
+    def compute_orth_abs_loss(self) -> torch.Tensor:
         """
-        計算正交 Loss ，只在 Dynamic Expansion CL 有效
+        使當前任務新增的 LoRA A 權重，與過去任務的 LoRA A 權重在子空間上保持正交
         """
         # 非 dynamic_expansion，或 Task 1 
-        if lambda_orth <= 0 or not self.dynamic_expansion or len(self.lora_As) < 2:
-            return 0.0
+        if not self.dynamic_expansion or len(self.lora_As) < 2:
+            return self.lora_As[0].new_zeros(())
         
-        loss = 0
-        # 計算最後一組(當前訓練中)與前面所有組的正交性
+        current_A = self.lora_As[-1]
+        loss = current_A.new_zeros(())
+        for i in range(len(self.lora_As) - 1):
+            loss += torch.abs(torch.mm(self.lora_As[i], current_A.T)).sum()
+            
+        return loss
+    
+    def compute_orth_pow_loss(self) -> torch.Tensor:
+        """
+        使當前任務新增的 LoRA 權重，與過去任務的 LoRA 權重在子空間上保持正交
+        """
+        # 非 dynamic_expansion，或 Task 1 
+        if not self.dynamic_expansion or len(self.lora_As) < 2:
+            return self.lora_As[0].new_zeros(())
+        
         current_A = self.lora_As[-1]
         current_B = self.lora_Bs[-1]
+        loss = current_A.new_zeros(())
+        # 計算最後一組(當前訓練中)與前面所有組的正交性
         for i in range(len(self.lora_As) - 1):
-            loss += torch.sum((current_A @ self.lora_As[i].T)**2)
-            loss += torch.sum((current_B.T @ self.lora_Bs[i])**2)
+            loss += torch.mm(self.lora_As[i], current_A.T).pow(2).sum()
+            loss += torch.mm(self.lora_Bs[i].T, current_B).pow(2).sum()
             
-        return lambda_orth * loss
+        return loss
 
 class Router(nn.Module):
     def __init__(
@@ -197,6 +217,7 @@ class MoEBlock(nn.Module):
         dynamic_expansion: bool = False, 
         num_experts: int = 4, 
         expert_rank: int = 8, 
+        lora_alpha: int = 32,
         top_k: int = 2
     ):
         """
@@ -209,7 +230,7 @@ class MoEBlock(nn.Module):
         self.router = Router(input_dim, num_experts, top_k=top_k)
         # 建立專家列表，每個專家都是一個 LoRALayer，共享原本的 T5 權重，但有獨立的 LoRA 參數
         self.experts = nn.ModuleList([
-            LoRALayer(original_layer, dynamic_expansion, rank=expert_rank) 
+            LoRALayer(original_layer, dynamic_expansion, rank=expert_rank, lora_alpha=lora_alpha) 
             for _ in range(num_experts)
         ])
         # 統計數據，記錄每個專家被選擇次數，不存入 model_state_dict
@@ -289,12 +310,12 @@ class MoEBlock(nn.Module):
         
         return outputs
     
-    def compute_balance_loss(self, lambda_balance: float) -> torch.Tensor:
+    def compute_balance_loss(self) -> torch.Tensor:
         """
-        計算負載均衡損失
+        計算 MoE 負載均衡損失
         """
-        if lambda_balance <= 0 or self.last_scores is None:
-            return 0.0
+        if self.last_scores is None:
+            return self.router.weight.new_zeros(())
         
         """
         [注意] last_scores 只會保存最後一個 Micro-Batch 的分數。使用 accumulation_steps，這個 Loss 只反映最後一小批資料的負載均衡狀況，導致 Loss 計算不穩定（Noisy）。
@@ -308,4 +329,4 @@ class MoEBlock(nn.Module):
         # 使用 MSE 計算當前分佈與均勻分佈的差異
         loss = ((expert_mean_usage - balance_target)**2).mean()
 
-        return lambda_balance * loss
+        return loss

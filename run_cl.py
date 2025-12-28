@@ -1,3 +1,4 @@
+# run_cl.py
 import os
 import sys
 import shutil
@@ -33,14 +34,16 @@ COMMON_ARGS = {
     "--dynamic_expansion": "",     # 空字串代表 True
     "--num_experts": "4",          # 預設值 4
     "--expert_rank": "8",          # 預設值 8
+    "--lora_alpha": "32",          # 預設值 32
     "--top_k": "2",                # 預設值 2
-    "--num_epochs": "1",           # O-LoRA 預設值 1，OrthMoE 預設值 3
-    "--lr": "1e-3",                # O-LoRA 預設值 1e-3，OrthMoE 預設值 5e-4
+    "--num_epochs": "1",           # O-LoRA 預設值 1
+    "--lr": "1e-3",                # O-LoRA 預設值 1e-3
     "--batch_size": "8",
     "--accumulation_steps": "8",
-    "--lambda_orth": "0.5",
+    "--lambda_orth_l1": "0.5",
+    "--lambda_orth_l2": "0.0",
     "--lambda_balance": "0.0",
-    "--max_input_length": "256",   # O-LoRA 預設值 512 (OOM)，OrthMoE 預設值 256
+    "--max_input_length": "256",   # O-LoRA 預設值 512
     "--max_label_length": "50",
     # "--debug": ""                  # 空字串代表 True
 }
@@ -182,14 +185,18 @@ def main():
                 "python", "main.py",
                 "--data_file", train_file,
                 "--labels_file", labels_file,
-                "--eval_file", eval_file,
-                "--eval_labels_files", labels_file,
                 "--output_dir", output_dir,
                 "--plot_dir", task_plot_dir,
                 "--dataset_name", dataset_name,
                 "--base_model_name", BASE_MODEL,
                 "--seed", str(seed)
             ]
+
+            if int(COMMON_ARGS["--num_epochs"]) > 1:
+                cmd.append("--eval_file")
+                cmd.append(eval_file)
+                cmd.append("--eval_labels_files")
+                cmd.append(labels_file)
 
             # 加入通用參數
             for k, v in COMMON_ARGS.items():
