@@ -11,6 +11,7 @@ logger = setup_logger(__name__)
 
 def collate_fn(batch):
     """
+    [靜態堆疊函式]（已棄用）
     DataLoader 的校對函式 (Collate Function)。
     將 List[Dict] 轉換為 Dict[Tensor]，準備輸入給模型。
     """

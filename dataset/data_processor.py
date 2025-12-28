@@ -5,7 +5,7 @@ import random
 import pandas as pd
 from torch.utils.data import DataLoader, Subset
 from datasets import Dataset, disable_progress_bar
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, DataCollatorForSeq2Seq
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -211,13 +211,13 @@ class DataProcessor:
 
     def tokenize_data(self, examples):
         """
-        批次 Tokenize 函數，同時處理 Input Text 和 Labels
+        批次 Tokenize 函數，同時處理 Input Text 和 Labels，不做 Padding
         """
         # 1. Tokenize input_text (Encoder 輸入)
         model_inputs = self.tokenizer(
             examples["input_text"],
             max_length=self.max_input_length,
-            padding="max_length",
+            padding=False,
             truncation=True
         )
 
@@ -228,22 +228,12 @@ class DataProcessor:
         labels = self.tokenizer(
             label_texts,
             max_length=self.max_label_length,
-            padding="max_length",
+            padding=False,
             truncation=True
         )
 
-        # 3. 處理 Labels 的 Padding Mask
-        label_masks = labels["attention_mask"]
-        label_ids = labels["input_ids"]
-
-        # 將 Padding 的 Label ID 設為 -100 以忽略 CrossEntropyLoss 計算
-        for i in range(len(label_ids)):
-            for j in range(len(label_ids[i])):
-                if label_masks[i][j] == 0:
-                    label_ids[i][j] = -100
-
-        # 加到 model_inputs
-        model_inputs["labels"] = label_ids
+        # 將 labels 的 input_ids 存入 model_inputs
+        model_inputs["labels"] = labels["input_ids"]
 
         return model_inputs
 
@@ -284,11 +274,20 @@ class DataProcessor:
 
     def get_dataloader(self, dataset, batch_size, collate_fn):
         """
-        根據 Dataset 建立 DataLoader
+        根據 Dataset 建立 DataLoader，使用動態 Padding 的 Collator
         """
+        if collate_fn is None:
+            # 使用 HF 標準的 Seq2Seq Collator
+            collate_fn = DataCollatorForSeq2Seq(
+                tokenizer=self.tokenizer,
+                model=None,
+                padding=True,
+                label_pad_token_id=-100
+            )
+
         return DataLoader(
             dataset, 
-            batch_size=batch_size, 
+            batch_size, 
             collate_fn=collate_fn
         )
     

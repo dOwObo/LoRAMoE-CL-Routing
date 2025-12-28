@@ -8,7 +8,6 @@ import numpy as np
 import torch
 from dataset.data_processor import DataProcessor
 from model.custom_t5 import CustomT5Model
-from helper.utils import collate_fn
 from helper.trainer import Trainer
 from helper.logging import setup_logger
 # from helper.inference_efficiency import measure_inference_time, get_vram_usage
@@ -176,7 +175,7 @@ def main():
         train_dataloader = train_processor.get_subset_dataloader(
             train_dataset, 
             args.batch_size, 
-            collate_fn, 
+            collate_fn=None, 
             subset_size=1000, 
             shuffle=True
         )
@@ -184,7 +183,7 @@ def main():
             eval_dataloader = eval_processor.get_subset_dataloader(
                 eval_dataset, 
                 args.batch_size, 
-                collate_fn, 
+                collate_fn=None, 
                 subset_size=1000, 
                 shuffle=False
             )
@@ -192,13 +191,13 @@ def main():
         train_dataloader = train_processor.get_dataloader(
             train_dataset, 
             args.batch_size, 
-            collate_fn
+            collate_fn=None
         )
         if eval_dataset:
             eval_dataloader = eval_processor.get_dataloader(
                 eval_dataset, 
                 args.batch_size, 
-                collate_fn
+                collate_fn=None
             )
         
     # ========== 3. 初始化模型 ==========
@@ -341,7 +340,7 @@ def main():
                 test_dataloader = test_processor.get_subset_dataloader(
                     test_dataset, 
                     args.batch_size, 
-                    collate_fn, 
+                    collate_fn=None, 
                     subset_size=1000, 
                     shuffle=False
                 )
@@ -349,7 +348,7 @@ def main():
                 test_dataloader = test_processor.get_dataloader(
                     test_dataset, 
                     args.batch_size, 
-                    collate_fn
+                    collate_fn=None
                 )
             
             # 替換 Trainer 的 eval_loader 進行測試

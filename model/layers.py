@@ -316,10 +316,7 @@ class MoEBlock(nn.Module):
         """
         if self.last_scores is None:
             return self.router.weight.new_zeros(())
-        
-        """
-        [注意] last_scores 只會保存最後一個 Micro-Batch 的分數。使用 accumulation_steps，這個 Loss 只反映最後一小批資料的負載均衡狀況，導致 Loss 計算不穩定（Noisy）。
-        """
+
         # [batch_size, seq_len, num_experts] -> [seq_len, num_experts] -> [num_experts]
         expert_mean_usage = self.last_scores.mean(dim=0).mean(dim=0) 
         
