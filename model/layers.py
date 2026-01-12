@@ -20,6 +20,145 @@ def orthogonal_projection(old_param: torch.Tensor, new_param: torch.Tensor) -> t
 
     return new_proj
 
+class LoRALinear(nn.Module):
+    def __init__(
+        self, 
+        original_layer: nn.Module,
+        dynamic_expansion: bool = False, 
+        rank: int = 8,
+        lora_alpha: int = 32
+    ):
+        """
+        針對 nn.Linear 的 LoRA Wrapper，支援 O-LoRA 的正交 Loss 與動態擴充
+        """
+        super().__init__()
+        self.original_layer = original_layer
+        self.dynamic_expansion = dynamic_expansion
+        self.rank = rank
+        self.lora_alpha = lora_alpha
+        self.scaling = self.lora_alpha / self.rank
+        self.dropout = nn.Dropout(0.1)
+
+        out_dim, in_dim = original_layer.weight.shape
+
+        # 根據 CL 策略初始化
+        if self.dynamic_expansion:
+            # LoRA 參數池
+            self.lora_As = nn.ParameterList()
+            self.lora_Bs = nn.ParameterList()
+
+            # 初始化第一組 LoRA 參數
+            self.new_pair_parameters(in_dim, out_dim)
+        else:
+            self.lora_A = nn.Parameter(torch.zeros((self.rank, in_dim))) 
+            self.lora_B = nn.Parameter(torch.zeros((out_dim, self.rank)))
+
+            self.reset_parameters()
+
+    def reset_parameters(self):
+        """
+        初始化單一參數模式的權重
+        """
+        if not self.dynamic_expansion:
+            # lora_A 使用 Kaiming 初始化，保留變異數
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            # lora_B 初始化為 0，確保訓練初期 LoRA 輸出為 0，不影響原始模型表現
+            nn.init.zeros_(self.lora_B)
+
+    def new_pair_parameters(self, in_dim=None, out_dim=None):
+        """
+        新增一組 LoRA 參數
+        """
+        if in_dim is None or out_dim is None:
+            out_dim, in_dim = self.original_layer.weight.shape
+            
+        device = self.original_layer.weight.device
+        
+        new_A = nn.Parameter(torch.zeros((self.rank, in_dim), device=device))
+        new_B = nn.Parameter(torch.zeros((out_dim, self.rank), device=device))
+
+        nn.init.kaiming_uniform_(new_A, a=math.sqrt(5))        
+        nn.init.zeros_(new_B)
+
+        self.lora_As.append(new_A)
+        self.lora_Bs.append(new_B)
+
+    def add_new_task(self):
+        """
+        當新任務來時，動態新增 LoRA 參數
+        """
+        if self.dynamic_expansion:
+            # 凍結舊參數
+            for param in self.lora_As: param.requires_grad = False
+            for param in self.lora_Bs: param.requires_grad = False
+            # 建立新參數
+            self.new_pair_parameters()
+        else:
+            # 保留舊知識，不重置
+            self.lora_A.requires_grad = True
+            self.lora_B.requires_grad = True
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: (Batch, Seq_Len, Dim)
+        """
+        # 1. 原始路徑
+        intermediate = self.original_layer(hidden_states)
+
+        # 2. LoRA 路徑，先降維 (x @ A.T) -> Dropout -> 再升維 (@ B.T)
+        lora_output = torch.zeros_like(intermediate)
+        if self.dynamic_expansion:
+            for A, B in zip(self.lora_As, self.lora_Bs):
+                lora_output += (self.dropout(hidden_states) @ A.T) @ B.T
+                """
+                # [Debug] 觀察 LoRA 有沒有學到東西
+                lora_norm = lora_output.norm().item()
+                lora_total_norm += lora_norm
+                """
+        else:
+            lora_output = (self.dropout(hidden_states) @ self.lora_A.T) @ self.lora_B.T
+        
+        lora_output = lora_output * self.scaling
+
+        # 3. 加總: (原始知識) + LoRA (微調知識)
+        output = intermediate + lora_output
+        
+        return output
+    
+    def compute_orth_abs_loss(self) -> torch.Tensor:
+        """
+        使當前任務新增的 LoRA A 權重，與過去任務的 LoRA A 權重在子空間上保持正交
+        """
+        # 非 dynamic_expansion，或 Task 1 
+        if not self.dynamic_expansion or len(self.lora_As) < 2:
+            return self.lora_As[0].new_zeros(())
+        
+        current_A = self.lora_As[-1]
+        loss = current_A.new_zeros(())
+        for i in range(len(self.lora_As) - 1):
+            loss += torch.abs(torch.mm(self.lora_As[i], current_A.T)).sum()
+            
+        return loss
+    
+    def compute_orth_pow_loss(self) -> torch.Tensor:
+        """
+        使當前任務新增的 LoRA 權重，與過去任務的 LoRA 權重在子空間上保持正交
+        """
+        # 非 dynamic_expansion，或 Task 1 
+        if not self.dynamic_expansion or len(self.lora_As) < 2:
+            return self.lora_As[0].new_zeros(())
+        
+        current_A = self.lora_As[-1]
+        current_B = self.lora_Bs[-1]
+        loss = current_A.new_zeros(())
+        # 計算最後一組(當前訓練中)與前面所有組的正交性
+        for i in range(len(self.lora_As) - 1):
+            loss += torch.mm(self.lora_As[i], current_A.T).pow(2).sum()
+            loss += torch.mm(self.lora_Bs[i].T, current_B).pow(2).sum()
+            
+        return loss
+    
 class LoRALayer(nn.Module):
     def __init__(
         self, 
@@ -81,9 +220,9 @@ class LoRALayer(nn.Module):
         nn.init.kaiming_uniform_(new_A, a=math.sqrt(5))
 
         # 若已有舊參數，進行正交投影初始化
-        if len(self.lora_As) > 0:
-            old_A = self.lora_As[-1].detach()
-            new_A.data = orthogonal_projection(old_A, new_A.data)
+        # if len(self.lora_As) > 0:
+        #     old_A = self.lora_As[-1].detach()
+        #     new_A.data = orthogonal_projection(old_A, new_A.data)
         
         nn.init.zeros_(new_B)
 

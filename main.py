@@ -93,7 +93,7 @@ def parse_args():
     # 模型架構設定
     parser.add_argument('--base_model_name', type=str, default="./initial_model/t5-large", help='Base model identifier (e.g., t5-small, t5-large).')
     parser.add_argument('--model_path', type=str, default=None, help='Path to a pretrained custom model (for CL Task 2+).')
-    parser.add_argument('--adapter_type', type=str, default="MoEBlock", choices=["LoRA", "MoEBlock"], help='Type of adapter: "LoRA" or "MoEBlock".')
+    parser.add_argument('--adapter_type', type=str, default="MoEBlock", choices=["O-LoRA", "LoRA", "MoEBlock"], help='Type of adapter: "O-LoRA", "LoRA" or "MoEBlock".')
     parser.add_argument('--dynamic_expansion', action='store_true', help='Enable Dynamic Expansion CL (freeze old, add new params).')
     parser.add_argument('--num_experts', type=int, default=4, help='Number of experts in MoE.')
     parser.add_argument('--expert_rank', type=int, default=8, help='Rank of LoRA matrices.')

@@ -1,7 +1,21 @@
 # model/forward_modifier.py
 import torch.nn as nn
-from transformers.models.t5.modeling_t5 import T5DenseActDense, T5DenseGatedActDense
-from model.layers import LoRALayer, MoEBlock
+from transformers.models.t5.modeling_t5 import T5Attention, T5DenseActDense, T5DenseGatedActDense
+from model.layers import LoRALinear, LoRALayer, MoEBlock
+
+def apply_lora_to_attention(model, dynamic_expansion=False, rank: int = 4, lora_alpha: int = 32):
+    """
+    將 T5 的 Attention 層 (q, v) 替換成 LoRALinear
+    """
+    for layer in model.modules():
+        if isinstance(layer, T5Attention):
+            # 依序替換 module 內的 Linear 層
+            if hasattr(layer, 'q'):
+                layer.q = LoRALinear(layer.q, dynamic_expansion, rank, lora_alpha)
+            if hasattr(layer, 'v'):
+                layer.v = LoRALinear(layer.v, dynamic_expansion, rank, lora_alpha)
+                
+    return model
 
 def apply_lora_to_ffn(model, dynamic_expansion=False, rank: int = 4, lora_alpha: int = 32):
     """

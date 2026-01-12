@@ -4,7 +4,7 @@ import csv
 import torch
 from tqdm import tqdm
 from transformers.optimization import get_scheduler
-from model.layers import LoRALayer, MoEBlock
+from model.layers import LoRALinear, LoRALayer, MoEBlock
 from helper.utils import evaluate, plot_metrics, visualize_expert_selection
 from helper.logging import setup_logger
 
@@ -115,7 +115,7 @@ class Trainer:
                         if lambda_orth_l1 > 0:
                             orth_l1_loss = sum(
                                 module.compute_orth_abs_loss() 
-                                for module in self.model.modules() if isinstance(module, LoRALayer)
+                                for module in self.model.modules() if isinstance(module, (LoRALinear, LoRALayer))
                             )
 
                         # LoRA L2 Orthogonal Loss (LoRA_A & LoRA_B)
@@ -123,7 +123,7 @@ class Trainer:
                         if lambda_orth_l2 > 0:
                             orth_l2_loss = sum(
                                 module.compute_orth_pow_loss() 
-                                for module in self.model.modules() if isinstance(module, LoRALayer)
+                                for module in self.model.modules() if isinstance(module, (LoRALinear, LoRALayer))
                             )
 
                         # MoE Load Balancing Loss

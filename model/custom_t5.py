@@ -3,8 +3,8 @@ import os
 import json
 import torch
 from transformers import T5ForConditionalGeneration
-from model.layers import LoRALayer, MoEBlock
-from model.forward_modifier import apply_lora_to_ffn, apply_moe_to_ffn
+from model.layers import LoRALinear, LoRALayer, MoEBlock
+from model.forward_modifier import apply_lora_to_attention, apply_lora_to_ffn, apply_moe_to_ffn
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -40,7 +40,15 @@ class CustomT5Model:
         self.model = T5ForConditionalGeneration.from_pretrained(base_model_path)
 
         # 3. 根據 adapter_type 決定使用哪種架構
-        if adapter_type == "LoRA":
+        if adapter_type == "O-LoRA":
+            logger.info(f"[Model] 將 Attention(Q,V) 替換成標準 LoRA 架構: Rank={expert_rank}")
+            self.model = apply_lora_to_attention(
+                self.model, 
+                dynamic_expansion,
+                rank=expert_rank,
+                lora_alpha=lora_alpha
+            )
+        elif adapter_type == "LoRA":
             logger.info(f"[Model] 將 FFN 替換成標準 LoRA 架構: Rank={expert_rank}")
             # 使用 expert_rank 作為 LoRA 的 rank
             self.model = apply_lora_to_ffn(
@@ -125,7 +133,7 @@ class CustomT5Model:
         count = 0
         for module in self.model.modules():
             # LoRA 和 MoE 內部的 Expert LoRA，執行擴充
-            if isinstance(module, LoRALayer):
+            if isinstance(module, (LoRALinear, LoRALayer)):
                 if hasattr(module, "add_new_task"):
                     module.add_new_task()
                     count += 1
@@ -142,10 +150,15 @@ class CustomT5Model:
         # 偵測目前的擴充次數
         expansion_count = 1
         try:
+            if self.adapter_type == "O-LoRA":
+                sample_layer = self.model.encoder.block[0].layer[0].SelfAttention.q
             # 取得第一個 Block 的 FFN 層
-            sample_layer = self.model.encoder.block[0].layer[1].DenseReluDense
+            else:
+                sample_layer = self.model.encoder.block[0].layer[1].DenseReluDense
             
-            if isinstance(sample_layer, LoRALayer) and sample_layer.dynamic_expansion:
+            if isinstance(sample_layer, LoRALinear) and sample_layer.dynamic_expansion:
+                expansion_count = len(sample_layer.lora_As)
+            elif isinstance(sample_layer, LoRALayer) and sample_layer.dynamic_expansion:
                 expansion_count = len(sample_layer.lora_As)
             elif isinstance(sample_layer, MoEBlock) and sample_layer.experts[0].dynamic_expansion:
                 expansion_count = len(sample_layer.experts[0].lora_As)
@@ -154,8 +167,15 @@ class CustomT5Model:
 
         # 1. 保存模型權重
         state_dict_path = os.path.join(save_directory, "model_state_dict.pt")
+        def is_param_to_save(name, param):
+            keywords = ["lora_", "experts", "router", "gate"]
+            if any(k in name for k in keywords):
+                return True
+            if param.requires_grad:
+                return True
+            return False
         # 儲存可訓練參數
-        to_save = {k: v for k, v in self.model.state_dict().items() if v.requires_grad}
+        to_save = {k: v for k, v in self.model.state_dict().items() if is_param_to_save(k, v)}
         torch.save(to_save, state_dict_path)
         logger.info(f"[System] 模型權重已保存: {state_dict_path}")
 
