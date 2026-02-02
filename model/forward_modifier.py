@@ -38,14 +38,14 @@ def apply_lora_to_ffn(model, dynamic_expansion=False, rank: int = 4, lora_alpha:
     
     return model
 
-def apply_moe_to_ffn(model, dynamic_expansion=False, num_experts: int = 4, expert_rank: int = 8, lora_alpha: int = 32, top_k: int = 2):
+def apply_moe_to_ffn(model, dynamic_expansion=False, num_experts: int = 4, expert_rank: int = 8, lora_alpha: int = 32, top_k: int = 2, task_embedding_dim=0):
     """
     將 T5 的 FFN 層替換成 MoEBlock
     """
     def replace_ffn_with_moe(layer):
         if isinstance(layer, (T5DenseActDense, T5DenseGatedActDense)):
             # 換成 MoEBlock
-            return MoEBlock(layer, dynamic_expansion, num_experts, expert_rank, lora_alpha, top_k)
+            return MoEBlock(layer, dynamic_expansion, num_experts, expert_rank, lora_alpha, top_k, task_embedding_dim)
         return layer
     
     for layer in model.encoder.block:

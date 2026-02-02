@@ -317,7 +317,8 @@ class Router(nn.Module):
         self, 
         input_dim: int, 
         num_experts: int, 
-        top_k: int = 2
+        top_k: int = 2,
+        task_embedding_dim: int = 0
     ):
         """
         決定每個 token 該去哪個專家，支援 Top-1 和 Top-K 兩種模式。
@@ -325,8 +326,18 @@ class Router(nn.Module):
         super().__init__() 
         self.gate = nn.Linear(input_dim, num_experts)
         self.top_k = top_k
+        self.task_embedding_dim = task_embedding_dim
 
-    def forward(self, hidden_states: torch.Tensor):
+        # 將 Task Vector (dim=4) 映射到 Expert Logits (dim=num_experts)
+        if task_embedding_dim > 0:
+            # Task Projection Layer
+            self.task_proj = nn.Linear(task_embedding_dim, num_experts, bias=False)
+            # 使用常態分佈初始化權重，讓模型剛開始就有「隨機的任務偏好」
+            nn.init.normal_(self.task_proj.weight, std=0.1)
+            # Learnable Scale，讓模型自己學習「任務資訊」對路由決策的重要性
+            self.task_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, hidden_states: torch.Tensor, task2vec: torch.Tensor=None):
         """
         Args:
             hidden_states: (Batch, Seq_Len, Dim)
@@ -336,6 +347,16 @@ class Router(nn.Module):
         """
         # 計算每個專家的分數 (Logits)
         logits = self.gate(hidden_states)
+
+        # 加入 Task bias
+        if self.task_embedding_dim > 0 and task2vec is not None:
+            # 確保 task2vec 在正確的 device
+            task2vec = task2vec.to(logits.device)
+            # 投影: (TaskDim) -> (NumExperts)
+            task_bias = self.task_proj(task2vec) 
+            # 加權疊加，將 Task Bias 加到每一個 Token 上
+            logits = logits + (task_bias * self.task_scale)
+
         # 計算機率分佈 (Softmax)
         scores = F.softmax(logits, dim=-1)
 
@@ -357,7 +378,8 @@ class MoEBlock(nn.Module):
         num_experts: int = 4, 
         expert_rank: int = 8, 
         lora_alpha: int = 32,
-        top_k: int = 2
+        top_k: int = 2,
+        task_embedding_dim: int = 4
     ):
         """
         將 T5 原始 FFN 層替換成 Router 和多個 LoRALayer (Experts)。
@@ -366,7 +388,12 @@ class MoEBlock(nn.Module):
 
         # 初始化 Router
         input_dim = original_layer.wi.weight.size(1)
-        self.router = Router(input_dim, num_experts, top_k=top_k)
+        self.router = Router(
+            input_dim=input_dim, 
+            num_experts=num_experts,
+            top_k=top_k,
+            task_embedding_dim=task_embedding_dim
+        )
         # 建立專家列表，每個專家都是一個 LoRALayer，共享原本的 T5 權重，但有獨立的 LoRA 參數
         self.experts = nn.ModuleList([
             LoRALayer(original_layer, dynamic_expansion, rank=expert_rank, lora_alpha=lora_alpha) 
@@ -376,6 +403,7 @@ class MoEBlock(nn.Module):
         self.register_buffer("selection_counts", torch.zeros(num_experts, dtype=torch.long), persistent=False)
         # 儲存最後一次的分數 (用於計算 Load Balancing Loss)
         self.last_scores = None
+        self.current_task2vec = None
 
     def add_new_task(self):
         """
@@ -393,9 +421,15 @@ class MoEBlock(nn.Module):
         """
         self.selection_counts.zero_()
 
+    def set_task2vec(self, task2vec):
+        """
+        由 Model 層呼叫，設定當前 Batch 的任務偏差
+        """
+        self.current_task2vec = task2vec
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router 決定每個 token 要給哪個專家
-        top_k_experts, scores = self.router(hidden_states)
+        top_k_experts, scores = self.router(hidden_states, task2vec=self.current_task2vec)
         self.last_scores = scores
 
         # 初始化輸出 Tensor，形狀與 hidden_states 相同

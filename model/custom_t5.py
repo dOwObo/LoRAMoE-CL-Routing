@@ -39,6 +39,20 @@ class CustomT5Model:
         logger.info(f"[Model] 初始化 T5: {base_model_path}")
         self.model = T5ForConditionalGeneration.from_pretrained(base_model_path)
 
+        # Task2Vec 距離矩陣 -> 相似度矩陣
+        self.task_distance_matrix = torch.tensor([
+            [0.00, 0.1964064819786886, 0.09670605639515661, 0.1526607014685165], # dbpedia
+            [0.1964064819786886, 0.00, 0.19080118467137464, 0.25730985636496195], # amazon
+            [0.09670605639515661, 0.19080118467137464, 0.00, 0.13579727184674228], # yahoo
+            [0.1526607014685165, 0.25730985636496195, 0.13579727184674228, 0.00]  # agnews
+        ])
+        self.task_similarity_matrix = 1.0 - self.task_distance_matrix
+
+        # 取得任務特徵的維度 (等於任務數量)
+        num_tasks = self.task_distance_matrix.shape[0]
+
+        self.current_task_id = 0
+
         # 3. 根據 adapter_type 決定使用哪種架構
         if adapter_type == "O-LoRA":
             logger.info(f"[Model] 將 Attention(Q,V) 替換成標準 LoRA 架構: Rank={expert_rank}")
@@ -65,7 +79,8 @@ class CustomT5Model:
                 num_experts, 
                 expert_rank,
                 lora_alpha,
-                top_k
+                top_k,
+                task_embedding_dim=num_tasks
             )
         else:
             msg = f"[Error] Unknown adapter_type: {adapter_type}"
@@ -73,6 +88,32 @@ class CustomT5Model:
             raise ValueError(msg)
         
         self.model.to(self.device)
+
+    def set_current_task(self, dataset_name):
+        """
+        根據 dataset name 設定當前的 task_id，並更新所有 Router 的 bias
+        """
+        # 定義名稱到 ID 的映射 (需與 Task2Vec 矩陣順序一致)
+        task_map = {"dbpedia": 0, "amazon": 1, "yahoo": 2, "agnews": 3}
+        
+        if dataset_name not in task_map:
+            logger.warning(f"[Model] 未知任務 {dataset_name}，不使用 Task2Vec Bias")
+            self._update_router_bias(None)
+            return
+
+        self.current_task_id = task_map[dataset_name]
+        
+        # 取出對應的向量
+        bias_vector = self.task_similarity_matrix[self.current_task_id].to(self.device)
+        self._update_router_bias(bias_vector)
+
+    def _update_router_bias(self, bias_vector):
+        """
+        遍歷模型，將 bias 設定進所有的 MoEBlock
+        """
+        for module in self.model.modules():
+            if isinstance(module, MoEBlock):
+                module.set_task2vec(bias_vector)
     
     def get_moe_usage(self):
         """

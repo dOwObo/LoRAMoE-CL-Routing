@@ -51,6 +51,10 @@ class Trainer:
         """
         執行完整的訓練迴圈
         """
+        # 在訓練開始前設定當前任務
+        if hasattr(self.model_wrapper, "set_current_task"):
+            self.model_wrapper.set_current_task(dataset_name)
+
         # 優化器設定，使用 AdamW
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()), 
