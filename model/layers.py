@@ -328,10 +328,10 @@ class Router(nn.Module):
         self.top_k = top_k
         self.task_embedding_dim = task_embedding_dim
 
-        # 將 Task Vector (dim=4) 映射到 Expert Logits (dim=num_experts)
+        # Input Fusion Strategy
         if task_embedding_dim > 0:
-            # Task Projection Layer
-            self.task_proj = nn.Linear(task_embedding_dim, num_experts, bias=False)
+            # 投影到 input_dim (hidden_size)，以便與 hidden_states 相加
+            self.task_proj = nn.Linear(task_embedding_dim, input_dim, bias=False)
             # 使用常態分佈初始化權重，讓模型剛開始就有「隨機的任務偏好」
             nn.init.normal_(self.task_proj.weight, std=0.1)
             # Learnable Scale，讓模型自己學習「任務資訊」對路由決策的重要性
@@ -345,17 +345,19 @@ class Router(nn.Module):
             top_k_experts: indices (Top-1) or (indices, values) (Top-K)
             scores: full probability distribution (Batch, Seq_Len, Num_Experts)
         """
-        # 計算每個專家的分數 (Logits)
-        logits = self.gate(hidden_states)
+        router_input = hidden_states
 
-        # 加入 Task bias
+        # Strategy: Input Fusion，將 Task 資訊融入 Input 特徵中，改變 Gate 看到的特徵分佈
         if self.task_embedding_dim > 0 and task2vec is not None:
             # 確保 task2vec 在正確的 device
-            task2vec = task2vec.to(logits.device)
-            # 投影: (TaskDim) -> (NumExperts)
-            task_bias = self.task_proj(task2vec) 
-            # 加權疊加，將 Task Bias 加到每一個 Token 上
-            logits = logits + (task_bias * self.task_scale)
+            task2vec = task2vec.to(hidden_states.device)
+            # 投影: (TaskDim) -> (HiddenDim)
+            task_features = self.task_proj(task2vec) 
+            # 融合: (Batch, Seq, Hidden) + (Hidden) * Scale
+            router_input = hidden_states + (task_features * self.task_scale)
+
+        # 計算每個專家的分數 (Logits)
+        logits = self.gate(router_input)
 
         # 計算機率分佈 (Softmax)
         scores = F.softmax(logits, dim=-1)
