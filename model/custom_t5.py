@@ -46,7 +46,14 @@ class CustomT5Model:
             [0.09670605639515661, 0.19080118467137464, 0.00, 0.13579727184674228], # yahoo
             [0.1526607014685165, 0.25730985636496195, 0.13579727184674228, 0.00]  # agnews
         ])
-        self.task_similarity_matrix = 1.0 - self.task_distance_matrix
+        similarity= 1.0 - self.task_distance_matrix
+
+        # 減去平均值，讓相似特徵歸零，差異特徵突出
+        mean_vec = similarity.mean(dim=0)
+        centered_sim = similarity - mean_vec
+
+        # 將數值範圍拉大
+        self.task_similarity_matrix = centered_sim * 10.0
 
         # 取得任務特徵的維度 (等於任務數量)
         num_tasks = self.task_distance_matrix.shape[0]
