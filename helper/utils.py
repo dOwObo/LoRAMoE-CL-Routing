@@ -154,6 +154,15 @@ def visualize_expert_selection(selection_counts, output_dir=".", title_suffix=""
     
     num_layers, num_experts = data.shape
 
+    # 儲存原始數據 (Raw Data) 為 JSON
+    try:
+        json_path = os.path.join(output_dir, f"raw_counts_{title_suffix.lower()}.json")
+        with open(json_path, 'w') as f:
+            import json # 確保有 import json
+            json.dump(data.tolist(), f)
+    except Exception as e:
+        logger.warning(f"[Error] 無法儲存 JSON 數據: {e}")
+
     # 繪製熱力圖 (Heatmap)
     try:
         # 計算每一層的百分比 (Normalized by Layer)

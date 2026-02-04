@@ -51,6 +51,7 @@ class Trainer:
         """
         執行完整的訓練迴圈
         """
+
         # 優化器設定，使用 AdamW
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()), 
@@ -217,16 +218,19 @@ class Trainer:
         logger.info(f"Best Accuracy Achieved: {best_accuracy:.4f}")
 
         # 繪圖
-        if not plot_dir:
-            plot_dir = output_dir
+        if plot_dir:
+            training_plot_dir = os.path.join(plot_dir, "training_phase", dataset_name)
+        else:
+            training_plot_dir = os.path.join(output_dir, "training_plots")
+        os.makedirs(training_plot_dir, exist_ok=True)
 
-        plot_metrics(self.train_losses, self.val_accuracies, plot_dir)
+        plot_metrics(self.train_losses, self.val_accuracies, training_plot_dir)
 
         # 獲取 MoE 統計數據並視覺化
         if self.model_wrapper.adapter_type == "MoEBlock":
             moe_usage = self.model_wrapper.get_moe_usage()
-            visualize_expert_selection(moe_usage['encoder'], plot_dir, title_suffix="Encoder")
-            visualize_expert_selection(moe_usage['decoder'], plot_dir, title_suffix="Decoder")
+            visualize_expert_selection(moe_usage['encoder'], training_plot_dir, title_suffix="Encoder_Training")
+            visualize_expert_selection(moe_usage['decoder'], training_plot_dir, title_suffix="Decoder_Training")
     
     def validate(self, dataset_name):
         """
