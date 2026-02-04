@@ -8,7 +8,7 @@ import logging
 # ================= 實驗配置 (Configuration) =================
 
 # 1. 實驗種子
-SEEDS = [42]
+SEEDS = [42, 438, 689, 744]
 
 # 2. 基礎模型路徑
 BASE_MODEL = "./initial_model/t5-large"
@@ -171,10 +171,6 @@ def main():
             # 定義輸出目錄: results/{seed}/{dataset_name}
             output_dir = os.path.join(seed_dir, dataset_name)
             os.makedirs(output_dir, exist_ok=True)
-
-            # 定義該任務的圖片目錄: results/{seed}/all_plots/{dataset_name}
-            task_plot_dir = os.path.join(all_plots, dataset_name)
-            os.makedirs(task_plot_dir, exist_ok=True)
             
             # 2. 累積測試資料 (Accumulated Testing)
             accumulated_test_data.append(test_file)
@@ -186,7 +182,7 @@ def main():
                 "--data_file", train_file,
                 "--labels_file", labels_file,
                 "--output_dir", output_dir,
-                "--plot_dir", task_plot_dir,
+                "--plot_dir", all_plots,
                 "--dataset_name", dataset_name,
                 "--base_model_name", BASE_MODEL,
                 "--seed", str(seed)
