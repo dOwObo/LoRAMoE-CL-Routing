@@ -10,6 +10,7 @@ from dataset.data_processor import DataProcessor
 from model.custom_t5 import CustomT5Model
 from helper.trainer import Trainer
 from helper.logging import setup_logger
+from helper.utils import visualize_expert_selection
 # from helper.inference_efficiency import measure_inference_time, get_vram_usage
 
 logger = setup_logger(__name__)
@@ -353,8 +354,27 @@ def main():
             
             # 替換 Trainer 的 eval_loader 進行測試
             trainer.eval_dataloader = test_dataloader
+
+            # 繪圖時機修正：先歸零 -> 再驗證 -> 再繪圖
+            if args.adapter_type == "MoEBlock":
+                custom_model.reset_moe_usage()
+
             test_acc = trainer.validate(test_dataset_name)
             logger.info(f"Test Accuracy on {test_dataset_name}: {test_acc:.4f}")
+
+            if args.adapter_type == "MoEBlock":
+                inference_plot_dir = os.path.join(
+                    args.plot_dir if args.plot_dir else args.output_dir,
+                    "inference_phase", 
+                    f"model_after_{args.dataset_name}", # 當前訓練完的任務
+                    f"test_on_{test_dataset_name}"      # 正在測試的任務
+                )
+                os.makedirs(inference_plot_dir, exist_ok=True)
+                
+                moe_usage = custom_model.get_moe_usage()
+                visualize_expert_selection(moe_usage['encoder'], inference_plot_dir, title_suffix=f"Encoder_{test_dataset_name}")
+                visualize_expert_selection(moe_usage['decoder'], inference_plot_dir, title_suffix=f"Decoder_{test_dataset_name}")
+                logger.info(f"[System] 專家分佈圖已儲存至: {inference_plot_dir}")
 
             # 將測試結果寫入 CSV
             with open(test_results, 'a', newline='') as f:

@@ -8,14 +8,14 @@ import logging
 # ================= 實驗配置 (Configuration) =================
 
 # 1. 實驗種子
-SEEDS = [438, 689, 251, 744, 329]
+SEEDS = [42, 438, 689, 744]
 
 # 2. 基礎模型路徑
 BASE_MODEL = "./initial_model/t5-large"
 
 # 3. 資料夾設定
 DATA_ROOT = "./CL_Benchmark"
-RESULTS_ROOT = "O-LoRA"
+RESULTS_ROOT = "LoRAMoE-CL(MoE-Unknown)/only-wi-LoRA/Routing_Strategy/Task2Vec(InputFusion)"
 
 # 4. 資料集與任務類型的映射
 DATASET_TASK_MAP = {
@@ -30,8 +30,8 @@ TASK_ORDER = ["dbpedia", "amazon", "yahoo", "agnews"]
 
 # 6. 訓練參數
 COMMON_ARGS = {
-    "--adapter_type": "LoRA",
-    "--dynamic_expansion": "",     # 空字串代表 True
+    "--adapter_type": "MoEBlock",
+    # "--dynamic_expansion": "",     # 空字串代表 True
     "--num_experts": "4",          # 預設值 4
     "--expert_rank": "8",          # 預設值 8
     "--lora_alpha": "32",          # 預設值 32
@@ -40,7 +40,7 @@ COMMON_ARGS = {
     "--lr": "1e-3",                # O-LoRA 預設值 1e-3
     "--batch_size": "8",
     "--accumulation_steps": "8",
-    "--lambda_orth_l1": "0.5",
+    "--lambda_orth_l1": "0.0",
     "--lambda_orth_l2": "0.0",
     "--lambda_balance": "0.0",
     "--max_input_length": "256",   # O-LoRA 預設值 512
@@ -171,10 +171,6 @@ def main():
             # 定義輸出目錄: results/{seed}/{dataset_name}
             output_dir = os.path.join(seed_dir, dataset_name)
             os.makedirs(output_dir, exist_ok=True)
-
-            # 定義該任務的圖片目錄: results/{seed}/all_plots/{dataset_name}
-            task_plot_dir = os.path.join(all_plots, dataset_name)
-            os.makedirs(task_plot_dir, exist_ok=True)
             
             # 2. 累積測試資料 (Accumulated Testing)
             accumulated_test_data.append(test_file)
@@ -186,7 +182,7 @@ def main():
                 "--data_file", train_file,
                 "--labels_file", labels_file,
                 "--output_dir", output_dir,
-                "--plot_dir", task_plot_dir,
+                "--plot_dir", all_plots,
                 "--dataset_name", dataset_name,
                 "--base_model_name", BASE_MODEL,
                 "--seed", str(seed)
