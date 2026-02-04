@@ -327,6 +327,11 @@ def main():
         for test_data, test_label in zip(args.test_data_files, args.test_labels_files):
             test_dataset_name = os.path.basename(os.path.dirname(test_data))
             logger.info(f"[System] 正在處理測試資料: {test_data}")
+
+            # Task2Vec 邏輯修正
+            if hasattr(custom_model, "set_current_task"):
+                custom_model.set_current_task(test_dataset_name)
+                
             test_processor = DataProcessor(
                 data_file=test_data,
                 labels_file=test_label,
