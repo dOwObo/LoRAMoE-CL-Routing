@@ -10,7 +10,7 @@ from dataset.data_processor import DataProcessor
 from model.custom_t5 import CustomT5Model
 from helper.trainer import Trainer
 from helper.logging import setup_logger
-from helper.utils import visualize_expert_selection
+from helper.utils import visualize_expert_selection, plot_tsne_embeddings
 # from helper.inference_efficiency import measure_inference_time, get_vram_usage
 
 logger = setup_logger(__name__)
@@ -323,6 +323,9 @@ def main():
             msg = "[Error] 測試數據文件和標籤文件的數量不匹配"
             logger.error(msg)
             raise ValueError(msg)
+        
+        # 收集所有測試集供 Combined t-SNE 使用
+        accumulated_dataloaders = {}
 
         for test_data, test_label in zip(args.test_data_files, args.test_labels_files):
             test_dataset_name = os.path.basename(os.path.dirname(test_data))
@@ -352,6 +355,8 @@ def main():
                     collate_fn=None
                 )
             
+            accumulated_dataloaders[test_dataset_name] = test_dataloader
+
             # 替換 Trainer 的 eval_loader 進行測試
             trainer.eval_dataloader = test_dataloader
 
@@ -376,9 +381,39 @@ def main():
                 visualize_expert_selection(moe_usage['decoder'], inference_plot_dir, title_suffix=f"Decoder_{test_dataset_name}")
                 logger.info(f"[System] 專家分佈圖已儲存至: {inference_plot_dir}")
 
+            # 單一資料集 t-SNE
+            plot_tsne_embeddings(
+                model=model,
+                dataloader=test_dataloader,
+                tokenizer=train_processor.tokenizer,
+                dataset_name=test_dataset_name,
+                output_dir=inference_plot_dir,
+                title_suffix=f"Model after {args.dataset_name}"
+            )
+
             # 將測試結果寫入 CSV
             with open(test_results, 'a', newline='') as f:
                 csv.writer(f).writerow([args.dataset_name, test_dataset_name, float(test_acc)])
+
+        # 所有測試結束後，執行 Combined t-SNE
+        if len(accumulated_dataloaders) > 1:
+            logger.info("[System] 正在產生跨資料集 (Combined) 的 t-SNE 語義分佈圖...")
+            
+            combined_plot_dir = os.path.join(
+                args.plot_dir if args.plot_dir else args.output_dir,
+                "inference_phase",
+                f"model_after_{args.dataset_name}",
+                "test_on_COMBINED_DATASETS"
+            )
+            
+            plot_tsne_embeddings(
+                model=model,
+                dataloader=accumulated_dataloaders, 
+                tokenizer=train_processor.tokenizer,
+                dataset_name="Combined_Datasets",
+                output_dir=combined_plot_dir,
+                title_suffix=f"Model after {args.dataset_name}"
+            )
     else:
         logger.warning("[Warning] No test files provided. Skipping testing.")
 

@@ -5,7 +5,7 @@ import torch
 from tqdm import tqdm
 from transformers.optimization import get_scheduler
 from model.layers import LoRALinear, LoRALayer, MoEBlock
-from helper.utils import evaluate, plot_metrics, visualize_expert_selection
+from helper.utils import evaluate, plot_metrics, visualize_expert_selection, plot_tsne_embeddings
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -231,6 +231,17 @@ class Trainer:
             moe_usage = self.model_wrapper.get_moe_usage()
             visualize_expert_selection(moe_usage['encoder'], training_plot_dir, title_suffix="Encoder_Training")
             visualize_expert_selection(moe_usage['decoder'], training_plot_dir, title_suffix="Decoder_Training")
+
+        # 繪製訓練過程的 t-SNE 分佈圖
+        logger.info("[System] 正在繪製訓練過程 (Training Phase) 的 t-SNE 分佈圖...")
+        plot_tsne_embeddings(
+            model=self.model,
+            dataloader=self.train_dataloader,
+            tokenizer=self.tokenizer,
+            dataset_name=dataset_name,
+            output_dir=training_plot_dir,
+            title_suffix="Training_Phase"
+        )
     
     def validate(self, dataset_name):
         """

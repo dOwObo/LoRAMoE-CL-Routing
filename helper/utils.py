@@ -5,6 +5,8 @@ import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
+import hashlib
+from sklearn.manifold import TSNE
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -232,3 +234,165 @@ def visualize_expert_selection(selection_counts, output_dir=".", title_suffix=""
         plt.close()
 
     logger.info(f"[System] {title_suffix} 專家分佈圖已儲存至: {output_dir}")
+
+# 全局固定的顏色映射表 (t-SNE 使用)
+_EXPERT_PALETTE = sns.color_palette("tab20", 20) + sns.color_palette("tab20b", 20)
+_EXPERT_COLOR_DICT = {}
+_expert_pairs = [f"{i} & {j}" for i in range(4) for j in range(i+1, 4)]
+for idx, pair in enumerate(_expert_pairs):
+    _EXPERT_COLOR_DICT[pair] = _EXPERT_PALETTE[idx % len(_EXPERT_PALETTE)]
+
+_LABEL_PALETTE = sns.color_palette("husl", 100)
+def get_label_color(label_str):
+    hash_val = int(hashlib.md5(str(label_str).encode('utf-8')).hexdigest(), 16)
+    return _LABEL_PALETTE[hash_val % 100]
+
+_SOURCE_PALETTE = sns.color_palette("Set1", 9)
+def get_source_color(source_str):
+    hash_val = int(hashlib.md5(str(source_str).encode('utf-8')).hexdigest(), 16)
+    return _SOURCE_PALETTE[hash_val % 9]
+
+def _extract_features_for_tsne(model, dataloaders_dict, tokenizer, device, last_moe_block):
+    """
+    內部輔助函數：從 Dataloader 中提取 Encoder 特徵與標籤。
+    """
+    all_embeddings, all_labels, all_dataset_sources, all_dominant_experts = [], [], [], []
+
+    with torch.no_grad():
+        for d_name, d_loader in dataloaders_dict.items():
+            progress_bar = tqdm(d_loader, desc=f"Extracting {d_name}", disable=True)
+            for batch in progress_bar:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+
+                # 1. 獲取 T5 Encoder 的隱藏層輸出並做 Mean Pooling
+                encoder_outputs = model.get_encoder()(input_ids=input_ids, attention_mask=attention_mask)
+                hidden_states = encoder_outputs.last_hidden_state
+                
+                mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+                sum_embeddings = torch.sum(hidden_states * mask_expanded, 1)
+                sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+                mean_pooled = sum_embeddings / sum_mask 
+                all_embeddings.append(mean_pooled.cpu().numpy())
+
+                # 2. 提取真實標籤 (Gold Labels)
+                for label_seq in batch["labels"]:
+                    label_seq = label_seq[label_seq != -100]
+                    gold_text = tokenizer.decode(label_seq, skip_special_tokens=True).strip()
+                    all_labels.append(gold_text)
+                    all_dataset_sources.append(d_name)
+
+                # 3. 提取主要專家組合 (若為 MoE 模型)
+                if last_moe_block is not None and hasattr(last_moe_block, 'last_scores'):
+                    scores = last_moe_block.last_scores
+                    score_mask = attention_mask.unsqueeze(-1).float()
+                    scores_sum = torch.sum(scores * score_mask, dim=1) 
+                    valid_token_counts = torch.clamp(attention_mask.sum(dim=1, keepdim=True), min=1e-9).float()
+                    mean_scores = scores_sum / valid_token_counts
+
+                    top2_values, top2_indices = torch.topk(mean_scores, k=2, dim=-1)
+                    for pair in top2_indices.cpu().numpy():
+                        expert_a, expert_b = sorted(pair)
+                        all_dominant_experts.append(f"{expert_a} & {expert_b}")
+
+    return all_embeddings, all_labels, all_dataset_sources, all_dominant_experts
+
+def _plot_scatter(reduced_embeddings, group_labels, color_func, title, output_path, legend_title, is_dict_color=False):
+    """
+    內部輔助函數：負責繪製並儲存散佈圖。
+    """
+    plt.figure(figsize=(10, 8))
+    unique_groups = sorted(list(set(group_labels)))
+
+    for group in unique_groups:
+        indices = [i for i, x in enumerate(group_labels) if x == group]
+        color = color_func.get(group, "black") if is_dict_color else color_func(group)
+        
+        plt.scatter(
+            reduced_embeddings[indices, 0], reduced_embeddings[indices, 1], 
+            label=group, color=color, alpha=0.7, s=30, edgecolors='none' if not is_dict_color else 'w', linewidth=0.5
+        )
+
+    plt.title(title, fontsize=14)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title=legend_title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_tsne_embeddings(model, dataloader, tokenizer, dataset_name, output_dir, title_suffix=""):
+    """
+    提取 T5 Encoder 特徵並使用 t-SNE 降維可視化，包含存檔功能。
+    """
+    device = next(model.parameters()).device
+    model.eval()
+    
+    is_combined = isinstance(dataloader, dict)
+    dataloaders_dict = dataloader if is_combined else {dataset_name: dataloader}
+    logger.info(f"[System] 正在提取特徵以繪製 t-SNE ({title_suffix})...")
+
+    # 尋找最後一層的 MoEBlock
+    last_moe_block = None
+    try:
+        last_moe_block = model.encoder.block[-1].layer[1].DenseReluDense
+    except Exception as e:
+        logger.debug(f"[Debug] 未使用 MoEBlock，略過專家分類繪圖。")
+
+    # 1. 提取特徵
+    all_embeddings, all_labels, all_sources, all_experts = _extract_features_for_tsne(
+        model, dataloaders_dict, tokenizer, device, last_moe_block
+    )
+
+    if not all_embeddings:
+        logger.warning("[Warning] 沒有提取到任何特徵，跳過 t-SNE 繪製。")
+        return
+
+    embeddings = np.vstack(all_embeddings)
+    perplexity = min(30, len(embeddings) - 1) 
+    if perplexity < 1:
+        logger.warning("[Warning] 樣本數太少，無法執行 t-SNE。")
+        return
+
+    # 2. t-SNE 降維
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42)
+    reduced_embeddings = tsne.fit_transform(embeddings)
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_suffix = title_suffix.replace(' ', '_').replace(':', '').lower()
+
+    # 3. 儲存 t-SNE 數據 (.npz)
+    npz_path = os.path.join(output_dir, f"tsne_data_{dataset_name}_{safe_suffix}.npz")
+    np.savez_compressed(
+        npz_path,
+        high_dim_embeddings=embeddings,
+        reduced_embeddings=reduced_embeddings,
+        labels=np.array(all_labels),
+        sources=np.array(all_sources),
+        experts=np.array(all_experts)
+    )
+    logger.info(f"[System] t-SNE 數據已儲存至: {npz_path}")
+
+    # 4. 繪圖：依照真實標籤
+    _plot_scatter(
+        reduced_embeddings, all_labels, get_label_color,
+        f"t-SNE by Ground Truth - {dataset_name}\n(Task Context: {title_suffix})",
+        os.path.join(output_dir, f"tsne_ground_truth_{dataset_name}_{safe_suffix}.png"),
+        "Ground Truth"
+    )
+
+    # 5. 繪圖：依照資料集來源
+    if is_combined and len(dataloaders_dict) > 1:
+        _plot_scatter(
+            reduced_embeddings, all_sources, get_source_color,
+            f"t-SNE by Dataset Source - Combined Datasets\n({title_suffix})",
+            os.path.join(output_dir, f"tsne_combined_source_{safe_suffix}.png"),
+            "Dataset Source"
+        )
+
+    # 6. 繪圖：依照主要專家
+    if all_experts:
+        _plot_scatter(
+            reduced_embeddings, all_experts, _EXPERT_COLOR_DICT,
+            f"t-SNE by Top-2 Expert Pairs - {dataset_name}\n({title_suffix})",
+            os.path.join(output_dir, f"tsne_expert_pair_{dataset_name}_{safe_suffix}.png"),
+            "Selected Expert Pair", is_dict_color=True
+        )
