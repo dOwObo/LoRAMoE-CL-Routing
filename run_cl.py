@@ -15,7 +15,7 @@ BASE_MODEL = "./initial_model/t5-large"
 
 # 3. 資料夾設定
 DATA_ROOT = "./CL_Benchmark"
-RESULTS_ROOT = "LoRAMoE-CL(MoE-Unknown)/only-wi-LoRA/Baseline"
+RESULTS_ROOT = "LoRAMoE-CL(MoE-Unknown)/only-wi-LoRA/Semantic_Centroid"
 
 # 4. 資料集與任務類型的映射
 DATASET_TASK_MAP = {
@@ -43,6 +43,7 @@ COMMON_ARGS = {
     "--lambda_orth_l1": "0.0",
     "--lambda_orth_l2": "0.0",
     "--lambda_balance": "0.0",
+    "--lambda_prototype": "0.0",
     "--max_input_length": "256",   # O-LoRA 預設值 512
     "--max_label_length": "50",
     # "--debug": ""                  # 空字串代表 True

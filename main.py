@@ -111,6 +111,7 @@ def parse_args():
     parser.add_argument('--lambda_orth_l1', type=float, default=0.0, help='Weight for Orthogonal Loss (Abs).')
     parser.add_argument('--lambda_orth_l2', type=float, default=0.0, help='Weight for Orthogonal Loss (Square).')
     parser.add_argument('--lambda_balance', type=float, default=0.0, help='Weight for MoE Load Balancing Loss.')
+    parser.add_argument('--lambda_prototype', type=float, default=0.0, help='Weight for MoE Prototype Orthogonal Loss.')
     # 其他設定
     parser.add_argument('--max_input_length', type=int, default=256, help='Max sequence length for input.')
     parser.add_argument('--max_label_length', type=int, default=50, help='Max sequence length for labels.')
@@ -291,6 +292,7 @@ def main():
         lambda_orth_l1=args.lambda_orth_l1,
         lambda_orth_l2=args.lambda_orth_l2,
         lambda_balance=args.lambda_balance,
+        lambda_prototype=args.lambda_prototype,
         plot_dir=args.plot_dir,
         dataset_name=args.dataset_name
     )

@@ -323,8 +323,17 @@ class Router(nn.Module):
         決定每個 token 該去哪個專家，支援 Top-1 和 Top-K 兩種模式。
         """
         super().__init__() 
-        self.gate = nn.Linear(input_dim, num_experts)
+        self.num_experts = num_experts
         self.top_k = top_k
+
+        # 1. 建立可學習的語義中心 (Prototypes)
+        self.prototypes = nn.Parameter(torch.empty(num_experts, input_dim))
+
+        # 使用 Kaiming 初始化，讓初始中心點散佈在特徵空間中
+        nn.init.kaiming_uniform_(self.prototypes, a=math.sqrt(5))
+
+        # 2. 加入一個可學習的縮放因子 (Temperature inverse)
+        self.scaling = nn.Parameter(torch.tensor([10.0]))
 
     def forward(self, hidden_states: torch.Tensor):
         """
@@ -334,9 +343,17 @@ class Router(nn.Module):
             top_k_experts: indices (Top-1) or (indices, values) (Top-K)
             scores: full probability distribution (Batch, Seq_Len, Num_Experts)
         """
-        # 計算每個專家的分數 (Logits)
-        logits = self.gate(hidden_states)
-        # 計算機率分佈 (Softmax)
+       # 1. L2 正規化 Hidden States 與 Prototypes
+        norm_hidden = F.normalize(hidden_states, p=2, dim=-1)
+        norm_prototypes = F.normalize(self.prototypes, p=2, dim=-1)
+
+        # 2. 計算 Cosine Similarity (矩陣內積)
+        similarities = torch.matmul(norm_hidden, norm_prototypes.transpose(0, 1))
+
+        # 3. 加上縮放因子產生 Logits
+        logits = similarities * self.scaling
+
+        # 4. 計算機率分佈 (Softmax)
         scores = F.softmax(logits, dim=-1)
 
         # Top-1
@@ -348,6 +365,20 @@ class Router(nn.Module):
             top_k_experts = (top_k_indices, top_k_values)
         
         return top_k_experts, scores
+    
+    def compute_prototype_loss(self) -> torch.Tensor:
+        """
+        計算語義中心的正交損失 (Orthogonal Loss)。
+        強迫 4 個中心互相推開，避免它們全部擠在特徵空間的同一個角落。
+        """
+        norm_proto = F.normalize(self.prototypes, p=2, dim=-1)
+        sim_matrix = torch.matmul(norm_proto, norm_proto.T)
+        
+        mask = torch.eye(self.num_experts, device=sim_matrix.device).bool()
+        off_diagonal = sim_matrix[~mask]
+        
+        loss = torch.relu(off_diagonal).mean()
+        return loss
 
 class MoEBlock(nn.Module):
     def __init__(
@@ -454,7 +485,7 @@ class MoEBlock(nn.Module):
         計算 MoE 負載均衡損失
         """
         if self.last_scores is None:
-            return self.router.weight.new_zeros(())
+            return self.router.prototypes.new_zeros(())
 
         # [batch_size, seq_len, num_experts] -> [seq_len, num_experts] -> [num_experts]
         expert_mean_usage = self.last_scores.mean(dim=0).mean(dim=0) 

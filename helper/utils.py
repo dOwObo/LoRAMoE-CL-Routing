@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import hashlib
 from sklearn.manifold import TSNE
+from sklearn.metrics.pairwise import cosine_distances
 from helper.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -396,3 +397,32 @@ def plot_tsne_embeddings(model, dataloader, tokenizer, dataset_name, output_dir,
             os.path.join(output_dir, f"tsne_expert_pair_{dataset_name}_{safe_suffix}.png"),
             "Selected Expert Pair", is_dict_color=True
         )
+
+    # 7. 繪圖：專家中心點距離矩陣 (Expert Prototypes Distance Matrix)
+    if last_moe_block is not None and hasattr(last_moe_block, 'router') and hasattr(last_moe_block.router, 'prototypes'):
+        try:
+            prototypes = last_moe_block.router.prototypes.detach().cpu().numpy()
+            num_experts = prototypes.shape[0]
+            expert_labels = [f"Expert {i}" for i in range(num_experts)]
+            
+            # 計算專家中心點的餘弦距離矩陣
+            proto_dist_matrix = cosine_distances(prototypes)
+            
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(
+                proto_dist_matrix, 
+                annot=True, 
+                fmt=".3f", 
+                cmap="viridis_r", # 深紫色代表距離遠，黃色代表距離近(0)
+                xticklabels=expert_labels, 
+                yticklabels=expert_labels,
+                square=True,
+                cbar_kws={'label': 'Cosine Distance'}
+            )
+            plt.title(f"Expert Prototypes Distance Matrix\n({title_suffix})", fontsize=14)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f"expert_prototypes_distance_{safe_suffix}.png"), dpi=300, bbox_inches='tight')
+            plt.close()
+            logger.info(f"[System] Expert Prototypes Distance Matrix 已儲存")
+        except Exception as e:
+            logger.error(f"[Error] 繪製 Expert Prototypes Distance Matrix 失敗: {e}")

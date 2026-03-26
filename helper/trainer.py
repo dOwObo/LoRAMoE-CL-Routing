@@ -45,6 +45,7 @@ class Trainer:
         lambda_orth_l1: float,
         lambda_orth_l2: float,
         lambda_balance: float,
+        lambda_prototype: float,
         plot_dir: str,
         dataset_name: str
     ):
@@ -135,7 +136,15 @@ class Trainer:
                                 for module in self.model.modules() if isinstance(module, MoEBlock)
                             )
 
-                        loss = loss + (lambda_orth_l1 * orth_l1_loss) + (lambda_orth_l2 * orth_l2_loss) + (lambda_balance * lb_loss)
+                        # MoE Prototype Loss
+                        proto_loss = loss.new_zeros(())
+                        if lambda_prototype > 0:
+                            proto_loss = sum(
+                                module.router.compute_prototype_loss() 
+                                for module in self.model.modules() if isinstance(module, MoEBlock)
+                            )
+
+                        loss = loss + (lambda_orth_l1 * orth_l1_loss) + (lambda_orth_l2 * orth_l2_loss) + (lambda_balance * lb_loss) + + (lambda_prototype * proto_loss)
 
                         # 梯度累積
                         loss = loss / accumulation_steps

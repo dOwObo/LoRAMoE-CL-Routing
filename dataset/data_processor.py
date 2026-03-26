@@ -195,7 +195,6 @@ class DataProcessor:
         try:
             options = ", ".join(self.labels_list)
             input_text = (
-                f"Task:{self.task}\nDataset:{self.dataset_name}\n"
                 f"{self.instruction}"
                 f"Option: {options}\n"
                 f"{example['sentence']}\nAnswer:"
